@@ -106,6 +106,9 @@ class AbstractIndex
 
     template <typename label_type> void set_universal_label(const label_type universal_label);
 
+    // 控制查询阶段标签扩展的K值（默认0表示不扩展）
+    virtual void set_expand_labels_k(uint32_t k) = 0;
+
   private:
     virtual void _build(const DataType &data, const size_t num_points_to_load, TagVector &tags) = 0;
     virtual std::pair<uint32_t, uint32_t> _search(const DataType &query, const size_t K, const uint32_t L,

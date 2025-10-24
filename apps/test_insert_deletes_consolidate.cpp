@@ -379,6 +379,9 @@ int main(int argc, char **argv)
     size_t points_to_skip, max_points_to_insert, beginning_index_size, points_per_checkpoint, checkpoints_per_snapshot,
         points_to_delete_from_beginning, start_deletes_after;
     bool concurrent;
+    // 【新增参数 - 中文说明】是否启用标签相关性β与其强度（用于增量插入阶段启用β剪枝）
+    bool use_label_correlation = false;
+    float beta_strength = 1.0f;
 
     // label options
     std::string label_file, label_type, universal_label;
@@ -450,6 +453,14 @@ int main(int argc, char **argv)
                                        po::value<uint32_t>(&unique_labels_supported)->default_value(0),
                                        "Number of unique labels supported by the dynamic index.");
 
+        // 【新增可选参数 - 中文说明】启用β剪枝与β强度（仅在过滤索引下生效）
+        optional_configs.add_options()("use_label_correlation",
+                                       po::bool_switch()->default_value(false),
+                                       "Enable beta factor based on label correlation (filtered index only)");
+        optional_configs.add_options()("beta_strength",
+                                       po::value<float>(&beta_strength)->default_value(1.0f),
+                                       "Strength of beta factor influence (default 1.0)");
+
         optional_configs.add_options()(
             "num_start_points",
             po::value<uint32_t>(&num_start_pts)->default_value(diskann::defaults::NUM_FROZEN_POINTS_DYNAMIC),
@@ -501,6 +512,9 @@ int main(int argc, char **argv)
                                                    .with_alpha(alpha)
                                                    .with_num_threads(num_threads)
                                                    .with_filter_list_size(Lf)
+                                                   // 【新增传递 - 中文说明】将CLI参数传递到构建参数，启用β与设置强度
+                                                   .with_use_label_correlation(use_label_correlation)
+                                                   .with_beta_strength(beta_strength)
                                                    .build();
 
         if (data_type == std::string("int8"))

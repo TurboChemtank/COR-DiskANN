@@ -30,7 +30,8 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                         const std::string &query_file, const std::string &truthset_file, const uint32_t num_threads,
                         const uint32_t recall_at, const bool print_all_recalls, const std::vector<uint32_t> &Lvec,
                         const bool dynamic, const bool tags, const bool show_qps_per_thread,
-                        const std::vector<std::string> &query_filters, const float fail_if_recall_below)
+                        const std::vector<std::string> &query_filters, const float fail_if_recall_below,
+                        const uint32_t expand_labels_k)
 {
     using TagT = uint32_t;
     // Load the query file
@@ -92,6 +93,9 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     auto index = index_factory.create_instance();
     index->load(index_path.c_str(), num_threads, *(std::max_element(Lvec.begin(), Lvec.end())));
     std::cout << "Index loaded" << std::endl;
+
+    // 设置查询阶段标签扩展K
+    index->set_expand_labels_k(expand_labels_k);
 
     if (metric == diskann::FAST_L2)
         index->optimize_index_layout();
@@ -280,6 +284,7 @@ int main(int argc, char **argv)
     std::string data_type, dist_fn, index_path_prefix, result_path, query_file, gt_file, filter_label, label_type,
         query_filters_file;
     uint32_t num_threads, K;
+    uint32_t expand_labels_k = 0;
     std::vector<uint32_t> Lvec;
     bool print_all_recalls, dynamic, tags, show_qps_per_thread;
     float fail_if_recall_below = 0.0f;
@@ -331,6 +336,10 @@ int main(int argc, char **argv)
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
+
+        // 新增 CLI: expand_labels_k（必须在合并到 desc 之前注册）
+        optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
+                                       "Expand to Top-K correlated labels at query time (default 0)");
 
         // Output controls
         po::options_description output_controls("Output controls");
@@ -421,19 +430,20 @@ int main(int argc, char **argv)
             {
                 return search_memory_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
-                    Lvec, dynamic, tags, show_qps_per_thread, query_filters, fail_if_recall_below);
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters, fail_if_recall_below, expand_labels_k);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
-                    Lvec, dynamic, tags, show_qps_per_thread, query_filters, fail_if_recall_below);
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters, fail_if_recall_below, expand_labels_k);
             }
             else if (data_type == std::string("float"))
             {
                 return search_memory_index<float, uint16_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                             num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                            show_qps_per_thread, query_filters, fail_if_recall_below);
+                                                            show_qps_per_thread, query_filters, fail_if_recall_below,
+                                                            expand_labels_k);
             }
             else
             {
@@ -447,19 +457,22 @@ int main(int argc, char **argv)
             {
                 return search_memory_index<int8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                    num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                   show_qps_per_thread, query_filters, fail_if_recall_below);
+                                                   show_qps_per_thread, query_filters, fail_if_recall_below,
+                                                   expand_labels_k);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                     num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                    show_qps_per_thread, query_filters, fail_if_recall_below);
+                                                    show_qps_per_thread, query_filters, fail_if_recall_below,
+                                                    expand_labels_k);
             }
             else if (data_type == std::string("float"))
             {
                 return search_memory_index<float>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                   num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                  show_qps_per_thread, query_filters, fail_if_recall_below);
+                                                  show_qps_per_thread, query_filters, fail_if_recall_below,
+                                                  expand_labels_k);
             }
             else
             {

@@ -31,6 +31,8 @@ int main(int argc, char **argv)
     // 【新增参数 - 中文说明】是否启用基于标签相关性的β剪枝与其强度
     bool use_label_correlation = false; // 启用β
     float beta_strength = 1.0f;         // β强度
+    // 【新增参数】查询时扩展的相关标签个数K（默认0不扩展）
+    uint32_t expand_labels_k = 0;
 
     po::options_description desc{
         program_options_utils::make_program_description("build_memory_index", "Build a memory-based DiskANN index.")};
@@ -79,6 +81,9 @@ int main(int argc, char **argv)
                                        "Enable beta factor based on label correlation (filtered index only)");
         optional_configs.add_options()("beta_strength", po::value<float>(&beta_strength)->default_value(1.0f),
                                        "Strength of beta factor influence (default 1.0)");
+        // 【新增可选参数】查询时扩展Top-K相关标签
+        optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
+                                       "Expand to Top-K correlated labels at query time (default 0)");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -139,6 +144,7 @@ int main(int argc, char **argv)
                                       // 【新增传递 - 中文说明】将CLI参数传递到构建参数中
                                       .with_use_label_correlation(use_label_correlation)
                                       .with_beta_strength(beta_strength)
+                                      .with_num_correlated_labels_to_expand(expand_labels_k)
                                       .build();
 
         auto filter_params = diskann::IndexFilterParamsBuilder()

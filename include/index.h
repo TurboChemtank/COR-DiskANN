@@ -111,6 +111,18 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     DISKANN_DLLEXPORT void set_universal_label(const LabelT &label);
 
+    // 运行时覆盖查询时标签扩展K（可选）
+    void set_expand_labels_k(uint32_t k) override
+    {
+        _num_correlated_labels_to_expand = k;
+        if (_num_correlated_labels_to_expand > 0 && _filtered_index)
+        {
+            // 运行时启用扩展时，确保已根据当前已加载的标签数据计算相关性与Top-K
+            calculate_label_correlations();
+            compute_top_k_label_correlations();
+        }
+    }
+
     // Get converted integer label from string to int map (_label_map)
     DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label);
 
@@ -249,6 +261,9 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     void parse_label_file(const std::string &label_file, size_t &num_pts_labels);
 
+    // 计算每个标签的Top-K相关标签（按相关性分数降序）
+    void compute_top_k_label_correlations();
+
     std::unordered_map<std::string, LabelT> load_label_map(const std::string &map_file);
 
     // Returns the locations of start point and frozen points suitable for use
@@ -282,6 +297,9 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增声明 - 中文说明】根据两个点的标签计算两者的最大标签相关性分数（Ochiai），用于映射到β
     float compute_max_label_correlation(uint32_t a, uint32_t b) const;
+
+    // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
+    void update_label_correlations_incremental(const std::vector<LabelT> &labels);
 
     // add reverse links from all the visited nodes to node n.
     void inter_insert(uint32_t n, std::vector<uint32_t> &pruned_list, const uint32_t range,
@@ -403,12 +421,22 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 采用嵌套map: labelA -> (labelB -> score)
     std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
 
+    // 每个标签的Top-K相关标签列表
+    std::unordered_map<LabelT, std::vector<std::pair<float, LabelT>>> _label_top_correlations;
+
+    // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
+    std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> _label_pair_cooccurrence_count; // co(labelA,labelB)
+
     // Indexing parameters
     uint32_t _indexingQueueSize;
     uint32_t _indexingRange;
     uint32_t _indexingMaxC;
     float _indexingAlpha;
     uint32_t _indexingThreads;
+
+    // 查询时扩展的K
+    uint32_t _num_correlated_labels_to_expand{0};
 
     // Query scratch data structures
     ConcurrentQueue<InMemQueryScratch<T> *> _query_scratch;

@@ -105,6 +105,8 @@ Index<T, TagT, LabelT>::Index(const IndexConfig &index_config, std::shared_ptr<A
         // 【新增初始化 - 中文说明】从写入参数读取是否启用标签相关性与β强度
         _use_label_correlation = index_config.index_write_params->use_label_correlation; // 开关
         _beta_strength = index_config.index_write_params->beta_strength;                 // 影响幅度
+        // 【新增初始化】查询时扩展K
+        _num_correlated_labels_to_expand = index_config.index_write_params->num_correlated_labels_to_expand;
 
         if (index_config.index_search_params != nullptr)
         {
@@ -362,6 +364,78 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                         raw_label_writer << std::endl;
                     }
                     raw_label_writer.close();
+                }
+
+                // Persist label correlation related artifacts, if available
+                // 1) Correlation matrix
+                if (!_label_correlation_matrix.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_corr_matrix.txt");
+                    for (const auto &ra : _label_correlation_matrix)
+                    {
+                        out << ra.first << '\t';
+                        bool first = true;
+                        for (const auto &rb : ra.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << rb.first << "," << rb.second;
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
+                }
+
+                // 2) Top-K correlations per label
+                if (!_label_top_correlations.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_topk.txt");
+                    for (const auto &it : _label_top_correlations)
+                    {
+                        out << it.first << '\t';
+                        bool first = true;
+                        for (const auto &pr : it.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << pr.second << "," << pr.first; // store as label,score
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
+                }
+
+                // 3) Label occurrence count
+                if (!_label_occurrence_count.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_occ_count.txt");
+                    for (const auto &kv : _label_occurrence_count)
+                    {
+                        out << kv.first << '\t' << kv.second << '\n';
+                    }
+                    out.close();
+                }
+
+                // 4) Label pair co-occurrence count
+                if (!_label_pair_cooccurrence_count.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_pair_coocc_count.txt");
+                    for (const auto &ra : _label_pair_cooccurrence_count)
+                    {
+                        out << ra.first << '\t';
+                        bool first = true;
+                        for (const auto &rb : ra.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << rb.first << "," << rb.second;
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
                 }
             }
         }
@@ -636,6 +710,142 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
             _use_universal_label = true;
             universal_label_reader.close();
         }
+        
+        
+                // Load label correlation persistence files if present
+                {
+                    // 1) Correlation matrix
+                    std::string corr_matrix_file = std::string(filename) + "_label_corr_matrix.txt";
+                    if (file_exists(corr_matrix_file))
+                    {
+                        _label_correlation_matrix.clear();
+                        std::ifstream in(corr_matrix_file);
+                        std::string line;
+                        while (std::getline(in, line))
+                        {
+                            if (line.empty())
+                                continue;
+                            std::istringstream iss(line);
+                            std::string token;
+                            // labelA
+                            if (!std::getline(iss, token, '\t'))
+                                continue;
+                            LabelT a = (LabelT)std::stoul(token);
+                            // pairs: labelB,score;labelB2,score2;...
+                            if (std::getline(iss, token))
+                            {
+                                std::istringstream pairs_stream(token);
+                                std::string pair_tok;
+                                while (std::getline(pairs_stream, pair_tok, ';'))
+                                {
+                                    if (pair_tok.empty())
+                                        continue;
+                                    size_t comma_pos = pair_tok.find(',');
+                                    if (comma_pos == std::string::npos)
+                                        continue;
+                                    LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                                    float s = std::stof(pair_tok.substr(comma_pos + 1));
+                                    _label_correlation_matrix[a][b] = s;
+                                }
+                            }
+                        }
+                    }
+
+                    // 2) Top-K correlations per label
+                    std::string topk_file = std::string(filename) + "_label_topk.txt";
+                    if (file_exists(topk_file))
+                    {
+                        _label_top_correlations.clear();
+                        std::ifstream in(topk_file);
+                        std::string line;
+                        while (std::getline(in, line))
+                        {
+                            if (line.empty())
+                                continue;
+                            std::istringstream iss(line);
+                            std::string token;
+                            if (!std::getline(iss, token, '\t'))
+                                continue;
+                            LabelT a = (LabelT)std::stoul(token);
+                            if (std::getline(iss, token))
+                            {
+                                std::istringstream pairs_stream(token);
+                                std::string pair_tok;
+                                std::vector<std::pair<float, LabelT>> items;
+                                while (std::getline(pairs_stream, pair_tok, ';'))
+                                {
+                                    if (pair_tok.empty())
+                                        continue;
+                                    size_t comma_pos = pair_tok.find(',');
+                                    if (comma_pos == std::string::npos)
+                                        continue;
+                                    LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                                    float s = std::stof(pair_tok.substr(comma_pos + 1));
+                                    items.emplace_back(s, b);
+                                }
+                                _label_top_correlations[a] = std::move(items);
+                            }
+                        }
+                    }
+
+                    // 3) Label occurrence count
+                    std::string occ_file = std::string(filename) + "_label_occ_count.txt";
+                    if (file_exists(occ_file))
+                    {
+                        _label_occurrence_count.clear();
+                        std::ifstream in(occ_file);
+                        std::string line;
+                        while (std::getline(in, line))
+                        {
+                            if (line.empty())
+                                continue;
+                            std::istringstream iss(line);
+                            std::string la, cnts;
+                            if (!std::getline(iss, la, '\t'))
+                                continue;
+                            if (!std::getline(iss, cnts))
+                                continue;
+                            LabelT a = (LabelT)std::stoul(la);
+                            uint64_t c = (uint64_t)std::stoull(cnts);
+                            _label_occurrence_count[a] = c;
+                        }
+                    }
+
+                    // 4) Label pair co-occurrence count
+                    std::string coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
+                    if (file_exists(coocc_file))
+                    {
+                        _label_pair_cooccurrence_count.clear();
+                        std::ifstream in(coocc_file);
+                        std::string line;
+                        while (std::getline(in, line))
+                        {
+                            if (line.empty())
+                                continue;
+                            std::istringstream iss(line);
+                            std::string token;
+                            if (!std::getline(iss, token, '\t'))
+                                continue;
+                            LabelT a = (LabelT)std::stoul(token);
+                            if (std::getline(iss, token))
+                            {
+                                std::istringstream pairs_stream(token);
+                                std::string pair_tok;
+                                while (std::getline(pairs_stream, pair_tok, ';'))
+                                {
+                                    if (pair_tok.empty())
+                                        continue;
+                                    size_t comma_pos = pair_tok.find(',');
+                                    if (comma_pos == std::string::npos)
+                                        continue;
+                                    LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                                    uint64_t c = (uint64_t)std::stoull(pair_tok.substr(comma_pos + 1));
+                                    _label_pair_cooccurrence_count[a][b] = c;
+                                }
+                            }
+                        }
+                    }
+                }
     }
 
     _nd = data_file_num_pts - _num_frozen_pts;
@@ -812,6 +1022,12 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::iterate_to_fixed_point(
     InMemQueryScratch<T> *scratch, const uint32_t Lsize, const std::vector<uint32_t> &init_ids, bool use_filter,
     const std::vector<LabelT> &filter_labels, bool search_invocation)
 {
+    
+    // if(filter_labels.size() >1){
+    //     std::cout<<"ok checked"<<std::endl;
+    // }
+    // std::cout<<"filter_labels.size(): "<<filter_labels.size()<<std::endl;
+    
     std::vector<Neighbor> &expanded_nodes = scratch->pool();
     NeighborPriorityQueue &best_L_nodes = scratch->best_l_nodes();
     best_L_nodes.reserve(Lsize);
@@ -1192,9 +1408,17 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     std::unordered_map<LabelT, uint64_t> label_counts;
     // 统计标签对的共现次数（只统计有共现的对）
     std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> co_occurrence_counts;
-
-    for (uint32_t point_id = 0; point_id < _nd; ++point_id)
+    
+    
+    std::cout<<"_nd: "<<_nd<<std::endl;
+    
+    int num3=0;
+    
+    std::cout<<"location_to_labels.size(): "<<_location_to_labels.size()<<std::endl;
+    
+    for (uint32_t point_id = 0; point_id < _location_to_labels.size(); ++point_id)
     {
+        num3++;
         const auto &labels = _location_to_labels[point_id];
         // 对每个标签计数
         for (const auto &la : labels)
@@ -1213,10 +1437,21 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
             }
         }
     }
+    std::cout<<"num3: "<<num3<<std::endl;
+
+    // 将统计缓存至成员，供后续增量更新使用
+    _label_occurrence_count = label_counts;
+    _label_pair_cooccurrence_count = co_occurrence_counts;
 
     // 计算Ochiai相关性：co_occ / sqrt(cntA * cntB)
+    
+    int num1=0;
+    
     for (const auto &kvA : co_occurrence_counts)
     {
+        
+        num1++;
+        
         LabelT a = kvA.first;
         auto cntA_it = label_counts.find(a);
         if (cntA_it == label_counts.end() || cntA_it->second == 0)
@@ -1229,6 +1464,84 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
                 continue;
             double co = static_cast<double>(kvB.second);
             double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
+            float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
+            _label_correlation_matrix[a][b] = s;
+            _label_correlation_matrix[b][a] = s;
+        }
+    }
+    std::cout<<"num1: "<<num1<<std::endl;
+}
+
+// 计算每个标签的Top-K相关标签列表（降序），存入 _label_top_correlations
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
+{
+    _label_top_correlations.clear();
+    if (_num_correlated_labels_to_expand == 0 || !_filtered_index)
+        return;
+    
+    int num=0;
+        
+    std::cout<<"ok checked3"<<std::endl;
+    
+    for (const auto &rowEntry : _label_correlation_matrix)
+    {
+        const LabelT base = rowEntry.first;
+        const auto &row = rowEntry.second;
+        std::vector<std::pair<float, LabelT>> items;
+        items.reserve(row.size());
+        for (const auto &kv : row)
+        {
+            if (kv.first == base)
+                continue;
+            items.emplace_back(kv.second, kv.first);
+        }
+        std::sort(items.begin(), items.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        if (items.size() > _num_correlated_labels_to_expand)
+            items.resize(_num_correlated_labels_to_expand);
+        _label_top_correlations[base] = std::move(items);
+        
+        num++;
+    }
+    std::cout<<"_label_top_correlations.size(): "<<_label_top_correlations.size()<<std::endl;
+    std::cout<<"num: "<<num<<std::endl;
+}
+
+// 【新增实现 - 中文说明】基于新插入点的标签，增量更新统计并局部刷新相关性矩阵
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
+{
+    if (!_filtered_index || !_use_label_correlation)
+        return;
+    // 更新出现次数
+    for (const auto &la : labels)
+        _label_occurrence_count[la] += 1;
+    // 更新共现次数（对称）
+    for (size_t i = 0; i < labels.size(); ++i)
+    {
+        for (size_t j = i + 1; j < labels.size(); ++j)
+        {
+            LabelT a = labels[i];
+            LabelT b = labels[j];
+            _label_pair_cooccurrence_count[a][b] += 1;
+            _label_pair_cooccurrence_count[b][a] += 1;
+        }
+    }
+    // 仅重算与本次标签相关的矩阵条目
+    for (const auto &a : labels)
+    {
+        auto cntA_it = _label_occurrence_count.find(a);
+        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
+            continue;
+        for (const auto &b : labels)
+        {
+            if (a == b)
+                continue;
+            auto cntB_it = _label_occurrence_count.find(b);
+            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
+                continue;
+            double co = (double)_label_pair_cooccurrence_count[a][b];
+            double score = co / std::sqrt((double)cntA_it->second * (double)cntB_it->second);
             float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
             _label_correlation_matrix[a][b] = s;
             _label_correlation_matrix[b][a] = s;
@@ -2036,14 +2349,22 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
         _label_to_start_id[curr_label] = best_medoid;
         _medoid_counts[best_medoid]++;
     }
-
-    // 【新增调用 - 中文说明】在开始建图前计算标签相关性矩阵，供β动态剪枝使用
-    if (_use_label_correlation)
+    
+    
+    std::cout<<"ok checked"<<std::endl;
+    
+    // 【新增调用 - 中文说明】在开始建图前计算标签相关性矩阵（用于β或查询标签扩展）
+    if (_use_label_correlation || _num_correlated_labels_to_expand > 0)
     {
         calculate_label_correlations();
+        // 计算Top-K相关标签
+        std::cout<<"ok checked2"<<std::endl;
+        compute_top_k_label_correlations();
     }
 
     this->build(filename, num_points_to_load, tags);
+    
+    
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -2208,7 +2529,29 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
         tl.unlock();
 
     filter_vec.emplace_back(filter_label);
-
+    // 查询阶段：根据相关性扩展标签集合（OR逻辑）
+    // cout<<_num_correlated_labels_to_expand<<std::endl;
+    
+    int num=0;
+    
+    std:;cout<<_label_top_correlations.size()<<std::endl;
+    
+    if (_num_correlated_labels_to_expand > 0)
+    {
+        auto it = _label_top_correlations.find(filter_label);
+        if (it != _label_top_correlations.end())
+        {
+            for (const auto &score_and_label : it->second)
+            {
+                filter_vec.emplace_back(score_and_label.second);
+                num++;
+            }
+            // 去重
+            std::sort(filter_vec.begin(), filter_vec.end());
+            filter_vec.erase(std::unique(filter_vec.begin(), filter_vec.end()), filter_vec.end());
+        }
+    }
+    std::cout<<"num: "<<num<<std::endl;
     _data_store->preprocess_query(query, scratch);
     auto retval = iterate_to_fixed_point(scratch, L, init_ids, true, filter_vec, true);
 
@@ -3007,6 +3350,12 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
         }
 
         _location_to_labels[location] = labels;
+        // 【新增增量更新 - 中文说明】插入新点后，增量刷新标签相关性统计与矩阵
+        if (_use_label_correlation || _num_correlated_labels_to_expand > 0)
+        {
+            update_label_correlations_incremental(labels);
+            compute_top_k_label_correlations();
+        }
 
         for (LabelT label : labels)
         {
