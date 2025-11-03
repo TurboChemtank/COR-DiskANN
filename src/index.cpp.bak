@@ -1410,11 +1410,11 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> co_occurrence_counts;
     
     
-    // std::cout<<"_nd: "<<_nd<<std::endl;
+    std::cout<<"_nd: "<<_nd<<std::endl;
     
     int num3=0;
     
-    // std::cout<<"location_to_labels.size(): "<<_location_to_labels.size()<<std::endl;
+    std::cout<<"location_to_labels.size(): "<<_location_to_labels.size()<<std::endl;
     
     for (uint32_t point_id = 0; point_id < _location_to_labels.size(); ++point_id)
     {
@@ -1437,7 +1437,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
             }
         }
     }
-    // std::cout<<"num3: "<<num3<<std::endl;
+    std::cout<<"num3: "<<num3<<std::endl;
 
     // 将统计缓存至成员，供后续增量更新使用
     _label_occurrence_count = label_counts;
@@ -1469,7 +1469,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
             _label_correlation_matrix[b][a] = s;
         }
     }
-    // std::cout<<"num1: "<<num1<<std::endl;
+    std::cout<<"num1: "<<num1<<std::endl;
 }
 
 // 计算每个标签的Top-K相关标签列表（降序），存入 _label_top_correlations
@@ -1482,7 +1482,7 @@ void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
     
     int num=0;
         
-    // std::cout<<"ok checked3"<<std::endl;
+    std::cout<<"ok checked3"<<std::endl;
     
     for (const auto &rowEntry : _label_correlation_matrix)
     {
@@ -1503,8 +1503,8 @@ void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
         
         num++;
     }
-    // std::cout<<"_label_top_correlations.size(): "<<_label_top_correlations.size()<<std::endl;
-    // std::cout<<"num: "<<num<<std::endl;
+    std::cout<<"_label_top_correlations.size(): "<<_label_top_correlations.size()<<std::endl;
+    std::cout<<"num: "<<num<<std::endl;
 }
 
 // 【新增实现 - 中文说明】基于新插入点的标签，增量更新统计并局部刷新相关性矩阵
@@ -2463,29 +2463,6 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search(const T *query, con
 }
 
 template <typename T, typename TagT, typename LabelT>
-std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::_search_with_filters(const DataType &query,
-                                                                           const std::string &raw_label, const size_t K,
-                                                                           const uint32_t L, std::any &indices,
-                                                                           float *distances)
-{
-    auto converted_label = this->get_converted_label(raw_label);
-    if (typeid(uint64_t *) == indices.type())
-    {
-        auto ptr = std::any_cast<uint64_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
-    }
-    else if (typeid(uint32_t *) == indices.type())
-    {
-        auto ptr = std::any_cast<uint32_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
-    }
-    else
-    {
-        throw ANNException("Error: Id type can only be uint64_t or uint32_t.", -1);
-    }
-}
-
-template <typename T, typename TagT, typename LabelT>
 template <typename IdType>
 std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const T *query, const LabelT &filter_label,
                                                                           const size_t K, const uint32_t L,
@@ -2534,7 +2511,7 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
     
     int num=0;
     
-    // std:;cout<<_label_top_correlations.size()<<std::endl;
+    // std::cout<<_label_top_correlations.size()<<std::endl;
     
     if (_num_correlated_labels_to_expand > 0)
     {
@@ -2557,37 +2534,42 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
 
     auto best_L_nodes = scratch->best_l_nodes();
 
+    // 仅返回包含原始 filter_label 的节点；堆中其他仅用于扩展
     size_t pos = 0;
-    for (size_t i = 0; i < best_L_nodes.size(); ++i)
     {
-        if (best_L_nodes[i].id < _max_points)
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        for (size_t i = 0; i < best_L_nodes.size(); ++i)
         {
-            const auto &node_labels = _location_to_labels[best_L_nodes[i].id];
-            
-            if (std::find(node_labels.begin(), node_labels.end(), filter_label) == node_labels.end()){
-                continue;
-            }
-            
-            indices[pos] = (IdType)best_L_nodes[i].id;
-
-            if (distances != nullptr)
+            if (best_L_nodes[i].id < _max_points)
             {
+                const auto &node_labels = _location_to_labels[best_L_nodes[i].id];
+                if (std::find(node_labels.begin(), node_labels.end(), filter_label) == node_labels.end())
+                {
+                    // 不包含原始标签：仅用于搜索扩展，不计入答案
+                    continue;
+                }
+
+                indices[pos] = (IdType)best_L_nodes[i].id;
+
+                if (distances != nullptr)
+                {
 #ifdef EXEC_ENV_OLS
-                // DLVS expects negative distances
-                distances[pos] = best_L_nodes[i].distance;
+                    // DLVS expects negative distances
+                    distances[pos] = best_L_nodes[i].distance;
 #else
-                distances[pos] = _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * best_L_nodes[i].distance
-                                                                                : best_L_nodes[i].distance;
+                    distances[pos] = _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * best_L_nodes[i].distance
+                                                                                    : best_L_nodes[i].distance;
 #endif
+                }
+                pos++;
             }
-            pos++;
+            if (pos == K)
+                break;
         }
-        if (pos == K)
-            break;
     }
     if (pos < K)
     {
-        // diskann::cerr << "Found fewer than K elements for query" << std::endl;
+        diskann::cerr << "Found fewer than K elements for query" << std::endl;
     }
 
     return retval;
