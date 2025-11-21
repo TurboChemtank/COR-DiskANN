@@ -1366,7 +1366,7 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
                 // 【新增β逻辑 - 中文说明】若启用标签相关性，则根据两个候选点的标签相似度计算β，调整djk
                 // β映射方式：beta = 1.0 + beta_strength * (corr - 0.5f) * 2  -> 将[0,1]映射到 [1-beta_strength,
                 // 1+beta_strength]
-                if (_use_label_correlation && _filtered_index)
+                if (_use_label_correlation && _filtered_index && _beta_strength != 0.0f)
                 {
                     float corr = compute_max_label_correlation(iter->id, iter2->id);
                     // 将相关性线性映射到β范围，保证β始终为正值
@@ -2472,12 +2472,12 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::_search_with_filters(const
     if (typeid(uint64_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint64_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances);
     }
     else if (typeid(uint32_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint32_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances);
     }
     else
     {
