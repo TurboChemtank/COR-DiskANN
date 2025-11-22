@@ -426,7 +426,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> _label_pair_cooccurrence_count; // co(labelA,labelB)
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>>
+        _label_pair_cooccurrence_count; // co(labelA,labelB)
 
     // Indexing parameters
     uint32_t _indexingQueueSize;

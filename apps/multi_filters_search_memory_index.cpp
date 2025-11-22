@@ -196,8 +196,8 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     const std::string qps_title = show_qps_per_thread ? "QPS/thread" : "QPS";
     uint32_t table_width = 0;
     // (省略了 'tags' 的特殊表格格式，专注于过滤搜索)
-    std::cout << std::setw(4) << "Ls" << std::setw(12) << qps_title << std::setw(18) << "Avg dist cmps"
-              << std::setw(20) << "Mean Latency (mus)" << std::setw(15) << "99.9 Latency";
+    std::cout << std::setw(4) << "Ls" << std::setw(12) << qps_title << std::setw(18) << "Avg dist cmps" << std::setw(20)
+              << "Mean Latency (mus)" << std::setw(15) << "99.9 Latency";
     table_width += 4 + 12 + 18 + 20 + 15;
 
     uint32_t recalls_to_print = 0;
@@ -284,7 +284,8 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                     if (temp_dists[j] != std::numeric_limits<float>::infinity())
                     {
                         // 使用 MIPS 调整后的距离（如果适用）进行排序
-                        float dist_for_comp = (metric == diskann::Metric::INNER_PRODUCT) ? -temp_dists[j] : temp_dists[j];
+                        float dist_for_comp =
+                            (metric == diskann::Metric::INNER_PRODUCT) ? -temp_dists[j] : temp_dists[j];
                         aggregated_results.insert(diskann::Neighbor(temp_ids[j], dist_for_comp));
                     }
                 }
@@ -306,12 +307,12 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                 pos++;
             }
             // 填充不足 K 的部分
-            while(pos < recall_at) {
+            while (pos < recall_at)
+            {
                 query_result_ids[test_id][i * recall_at + pos] = 0;
                 query_result_dists[test_id][i * recall_at + pos] = std::numeric_limits<float>::infinity();
                 pos++;
             }
-
 
             auto qe = std::chrono::high_resolution_clock::now(); // 停止计时
             std::chrono::duration<double> diff = qe - qs;
@@ -437,8 +438,7 @@ int main(int argc, char **argv)
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
         // 标签相关性与查询扩展
-        optional_configs.add_options()("expand_labels_k",
-                                       po::value<uint32_t>(&expand_labels_k)->default_value(0),
+        optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
         optional_configs.add_options()("use_label_correlation", po::bool_switch(&use_label_correlation),
                                        "Enable beta-based label correlation during search (default off)");
@@ -521,25 +521,25 @@ int main(int argc, char **argv)
         {
             if (data_type == std::string("int8"))
             {
-                return search_memory_index<int8_t, uint16_t>(metric, index_path_prefix, result_path, query_file, gt_file,
-                                                            num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                            show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                            expand_labels_k, use_label_correlation, beta_strength);
+                return search_memory_index<int8_t, uint16_t>(
+                    metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
+                    use_label_correlation, beta_strength);
             }
             else if (data_type == std::string("uint8"))
             {
-                return search_memory_index<uint8_t, uint16_t>(metric, index_path_prefix, result_path, query_file, gt_file,
-                                                             num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                             show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                             expand_labels_k, use_label_correlation, beta_strength);
+                return search_memory_index<uint8_t, uint16_t>(
+                    metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
+                    use_label_correlation, beta_strength);
             }
             else if (data_type == std::string("float"))
             {
-                std::cout<<"check1"<<std::endl;
-                return search_memory_index<float, uint16_t>(metric, index_path_prefix, result_path, query_file, gt_file,
-                                                            num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-                                                            show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                            expand_labels_k, use_label_correlation, beta_strength);
+                std::cout << "check1" << std::endl;
+                return search_memory_index<float, uint16_t>(
+                    metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
+                    use_label_correlation, beta_strength);
             }
             else
             {

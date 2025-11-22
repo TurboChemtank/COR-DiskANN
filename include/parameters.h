@@ -133,8 +133,7 @@ class IndexWriteParametersBuilder
         : _search_list_size(wp.search_list_size), _max_degree(wp.max_degree),
           _max_occlusion_size(wp.max_occlusion_size), _saturate_graph(wp.saturate_graph), _alpha(wp.alpha),
           _filter_list_size(wp.filter_list_size), _use_label_correlation(wp.use_label_correlation),
-          _beta_strength(wp.beta_strength),
-          _num_correlated_labels_to_expand(wp.num_correlated_labels_to_expand)
+          _beta_strength(wp.beta_strength), _num_correlated_labels_to_expand(wp.num_correlated_labels_to_expand)
     {
     }
     IndexWriteParametersBuilder(const IndexWriteParametersBuilder &) = delete;

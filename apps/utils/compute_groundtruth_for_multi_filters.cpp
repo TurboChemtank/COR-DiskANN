@@ -201,7 +201,8 @@ void compute_groundtruth(const std::string &data_type, const std::string &dist_f
     parse_label_file_into_vec(num_points_labels, label_file, location_to_labels_str);
     if (num_points_labels != npts)
     {
-        diskann::cerr << "Warning: labels lines != number of base points, proceeding with min(npts, lines)" << std::endl;
+        diskann::cerr << "Warning: labels lines != number of base points, proceeding with min(npts, lines)"
+                      << std::endl;
     }
     diskann::cout << "Loaded base label file" << std::endl;
 
@@ -249,17 +250,16 @@ void compute_groundtruth(const std::string &data_type, const std::string &dist_f
         for (uint32_t j = 0; j < npts; j++)
         {
             // 关键：执行“OR”逻辑检查
-            const std::vector<std::string> &base_point_labels = (j < location_to_labels_str.size())
-                                                                    ? location_to_labels_str[j]
-                                                                    : std::vector<std::string>();
+            const std::vector<std::string> &base_point_labels =
+                (j < location_to_labels_str.size()) ? location_to_labels_str[j] : std::vector<std::string>();
             bool matches_filter = check_label_set_intersection<std::string>(current_query_labels, base_point_labels,
                                                                             universal_label, use_universal_label);
 
             if (matches_filter)
             {
                 // 如果标签匹配，则计算距离
-                float dist = compute_distance_scalar<T>(query_data + i * qdim, base_data + j * ndim, (uint32_t)ndim,
-                                                        metric);
+                float dist =
+                    compute_distance_scalar<T>(query_data + i * qdim, base_data + j * ndim, (uint32_t)ndim, metric);
 
                 if (top_k.size() < K)
                 {

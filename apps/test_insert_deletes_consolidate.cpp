@@ -454,11 +454,9 @@ int main(int argc, char **argv)
                                        "Number of unique labels supported by the dynamic index.");
 
         // 【新增可选参数 - 中文说明】启用β剪枝与β强度（仅在过滤索引下生效）
-        optional_configs.add_options()("use_label_correlation",
-                                       po::bool_switch()->default_value(false),
+        optional_configs.add_options()("use_label_correlation", po::bool_switch()->default_value(false),
                                        "Enable beta factor based on label correlation (filtered index only)");
-        optional_configs.add_options()("beta_strength",
-                                       po::value<float>(&beta_strength)->default_value(1.0f),
+        optional_configs.add_options()("beta_strength", po::value<float>(&beta_strength)->default_value(1.0f),
                                        "Strength of beta factor influence (default 1.0)");
 
         optional_configs.add_options()(
