@@ -37,7 +37,9 @@ jobs:
           submodules: true
       - name: Build diskannpy dependency tree
         run: |
-          pip install diskannpy pipdeptree
+          # 仅生成依赖树，避免从 PyPI 安装 diskannpy 失败导致 CI 断掉
+          python -m pip install --upgrade pip
+          pip install pipdeptree
           echo "dependencies" > dependencies_${{ matrix.os }}.txt
           pipdeptree >> dependencies_${{ matrix.os }}.txt
       - name: Archive diskannpy dependencies artifact
