@@ -79,6 +79,15 @@ class AbstractIndex
                                                       const size_t K, const uint32_t L, IndexType *indices,
                                                       float *distances);
 
+    // 【新增接口 - 中文说明】
+    // 过滤搜索（可按本次调用控制是否启用“相关标签扩展”）。
+    // - use_expand=1：允许在搜索过程中把相关性高的其他标签加入 filter_vec（扩展搜索）
+    // - use_expand=0：只使用单个标签进行搜索（不扩展）
+    template <typename IndexType>
+    std::pair<uint32_t, uint32_t> search_with_filters(const DataType &query, const std::string &raw_label,
+                                                      const size_t K, const uint32_t L, const uint32_t use_expand,
+                                                      IndexType *indices, float *distances);
+
     // insert points with labels, labels should be present for filtered index
     template <typename data_type, typename tag_type, typename label_type>
     int insert_point(const data_type *point, const tag_type tag, const std::vector<label_type> &labels);
@@ -109,12 +118,22 @@ class AbstractIndex
     // 控制查询阶段标签扩展的K值（默认0表示不扩展）
     virtual void set_expand_labels_k(uint32_t k) = 0;
 
+    // 【新增接口 - 中文说明】返回“属性频率Otsu门槛值”（门槛是频率值，不是标签ID）
+    virtual uint32_t get_filter_frequency_threshold() const = 0;
+
+    // 【新增接口 - 中文说明】返回某个标签（raw string）的频率（出现次数）。若标签不存在或无统计信息则返回0。
+    virtual uint32_t get_filter_frequency(const std::string &raw_label) const = 0;
+
+    // 【新增接口 - 中文说明】调试/校验：打印或检查已加载的标签频率数组
+    virtual void check_label_frequency() const = 0;
+
   private:
     virtual void _build(const DataType &data, const size_t num_points_to_load, TagVector &tags) = 0;
     virtual std::pair<uint32_t, uint32_t> _search(const DataType &query, const size_t K, const uint32_t L,
                                                   std::any &indices, float *distances = nullptr) = 0;
     virtual std::pair<uint32_t, uint32_t> _search_with_filters(const DataType &query, const std::string &filter_label,
-                                                               const size_t K, const uint32_t L, std::any &indices,
+                                                               const size_t K, const uint32_t L,
+                                                               const uint32_t use_expand, std::any &indices,
                                                                float *distances) = 0;
     virtual int _insert_point(const DataType &data_point, const TagType tag, Labelvector &labels) = 0;
     virtual int _insert_point(const DataType &data_point, const TagType tag) = 0;

@@ -27,6 +27,73 @@
 
 namespace diskann
 {
+
+// 输入 filter_frequence: index是标签ID，value是该标签出现的次数
+static int calculate_otsu_threshold(const std::vector<int> &filter_frequence)
+{
+    if (filter_frequence.empty())
+        return 0;
+
+    // 1. 统计频率的直方图
+    // 注意：这里的“直方图”是以“频率值”作为索引，“拥有该频率的属性数量”作为值
+    int max_freq = *std::max_element(filter_frequence.begin(), filter_frequence.end());
+
+    // 如果最大频率很小，没必要分类
+    if (max_freq <= 1)
+        return 1;
+
+    // histogram[f] 表示出现次数恰好为 f 的属性有多少个
+    std::vector<int> histogram((size_t)max_freq + 1, 0);
+    int total_attributes = 0;
+    for (int freq : filter_frequence)
+    {
+        if (freq > 0) // 过滤掉未使用的标签
+        {
+            histogram[(size_t)freq]++;
+            total_attributes++;
+        }
+    }
+
+    double sum_freq = 0;
+    for (int f = 1; f <= max_freq; f++)
+    {
+        sum_freq += (double)f * histogram[(size_t)f];
+    }
+
+    double max_variance = 0;
+    int threshold_T = 0;
+
+    double w0 = 0;   // 低频组属性占比
+    double sum0 = 0; // 低频组频率总和
+
+    // 2. 迭代所有可能的阈值 t
+    for (int t = 1; t < max_freq; t++)
+    {
+        w0 += histogram[(size_t)t];
+        if (w0 == 0)
+            continue;
+
+        double w1 = total_attributes - w0;
+        if (w1 == 0)
+            break;
+
+        sum0 += (double)t * histogram[(size_t)t];
+
+        double mu0 = sum0 / w0;               // 低频组平均频率
+        double mu1 = (sum_freq - sum0) / w1;  // 高频组平均频率
+
+        // 计算类间方差: w0 * w1 * (mu0 - mu1)^2
+        double variance = w0 * w1 * std::pow(mu0 - mu1, 2);
+
+        if (variance > max_variance)
+        {
+            max_variance = variance;
+            threshold_T = t;
+        }
+    }
+
+    return threshold_T;
+}
 // Initialize an index with metric m, load the data of type T with filename
 // (bin), and initialize max_points
 template <typename T, typename TagT, typename LabelT>
@@ -437,6 +504,18 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                     }
                     out.close();
                 }
+
+                // 5) 标签频率数组与Otsu门槛值（用于搜索时判断是否需要扩展）
+                if (!_label_frequency.empty())
+                {
+                    std::string freq_file = std::string(filename) + "_label_freq_otsu.bin";
+                    delete_file(freq_file);
+                    std::vector<uint32_t> blob;
+                    blob.reserve(_label_frequency.size() + 1);
+                    blob.emplace_back(_label_frequency_otsu_threshold);
+                    blob.insert(blob.end(), _label_frequency.begin(), _label_frequency.end());
+                    save_bin<uint32_t>(freq_file, blob.data(), blob.size(), 1);
+                }
             }
         }
 
@@ -842,6 +921,20 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                             _label_pair_cooccurrence_count[a][b] = c;
                         }
                     }
+                }
+            }
+
+            // 5) 标签频率数组与Otsu门槛值
+            std::string freq_file = std::string(filename) + "_label_freq_otsu.bin";
+            if (file_exists(freq_file))
+            {
+                std::unique_ptr<uint32_t[]> buf;
+                size_t npts = 0, ndim = 0;
+                diskann::load_bin<uint32_t>(freq_file, buf, npts, ndim);
+                if (ndim == 1 && npts >= 1)
+                {
+                    _label_frequency_otsu_threshold = buf[0];
+                    _label_frequency.assign(buf.get() + 1, buf.get() + npts);
                 }
             }
         }
@@ -2206,11 +2299,12 @@ std::unordered_map<std::string, LabelT> Index<T, TagT, LabelT>::load_label_map(c
 }
 
 template <typename T, typename TagT, typename LabelT>
-LabelT Index<T, TagT, LabelT>::get_converted_label(const std::string &raw_label)
+LabelT Index<T, TagT, LabelT>::get_converted_label(const std::string &raw_label) const
 {
-    if (_label_map.find(raw_label) != _label_map.end())
+    auto it = _label_map.find(raw_label);
+    if (it != _label_map.end())
     {
-        return _label_map[raw_label];
+        return it->second;
     }
     if (_use_universal_label)
     {
@@ -2315,6 +2409,59 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
                 }
             }
         }
+    }
+
+    // 【新增 - 中文说明】统计每个标签出现的次数（频率数组），并用 Otsu 算法计算门槛值（频率门槛）
+    {
+        LabelT max_label = 0;
+        for (auto itr = _labels.begin(); itr != _labels.end(); ++itr)
+        {
+            max_label = std::max(max_label, *itr);
+        }
+
+        _label_frequency.clear();
+        _label_frequency.resize((size_t)max_label + 1, 0);
+
+        for (uint32_t point_id = 0; point_id < num_points_to_load; point_id++)
+        {
+            for (auto label : _location_to_labels[point_id])
+            {
+                // 遇到 universal label：该点被视为属于所有非 universal 标签
+                if (_use_universal_label && label == _universal_label)
+                {
+                    for (auto itr = _labels.begin(); itr != _labels.end(); ++itr)
+                    {
+                        const LabelT x = *itr;
+                        if (x == _universal_label)
+                        {
+                            continue;
+                        }
+                        if (x < _label_frequency.size())
+                        {
+                            _label_frequency[x] += 1;
+                        }
+                    }
+                }
+                else
+                {
+                    if (_use_universal_label && label == _universal_label)
+                    {
+                        continue;
+                    }
+                    if (label < _label_frequency.size())
+                    {
+                        _label_frequency[label] += 1;
+                    }
+                }
+            }
+        }
+
+        std::vector<int> freq_int(_label_frequency.size(), 0);
+        for (size_t i = 0; i < _label_frequency.size(); i++)
+        {
+            freq_int[i] = (int)_label_frequency[i];
+        }
+        _label_frequency_otsu_threshold = (uint32_t)calculate_otsu_threshold(freq_int);
     }
 
     uint32_t num_cands = 25;
@@ -2459,19 +2606,22 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search(const T *query, con
 template <typename T, typename TagT, typename LabelT>
 std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::_search_with_filters(const DataType &query,
                                                                            const std::string &raw_label, const size_t K,
-                                                                           const uint32_t L, std::any &indices,
+                                                                           const uint32_t L, const uint32_t use_expand,
+                                                                           std::any &indices,
                                                                            float *distances)
 {
     auto converted_label = this->get_converted_label(raw_label);
     if (typeid(uint64_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint64_t *>(indices);
-        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances,
+                                         use_expand);
     }
     else if (typeid(uint32_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint32_t *>(indices);
-        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances,
+                                         use_expand);
     }
     else
     {
@@ -2483,7 +2633,8 @@ template <typename T, typename TagT, typename LabelT>
 template <typename IdType>
 std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const T *query, const LabelT &filter_label,
                                                                           const size_t K, const uint32_t L,
-                                                                          IdType *indices, float *distances)
+                                                                          IdType *indices, float *distances,
+                                                                          const uint32_t use_expand)
 {
     if (K > (uint64_t)L)
     {
@@ -2530,7 +2681,7 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
 
     // std:;cout<<_label_top_correlations.size()<<std::endl;
 
-    if (_num_correlated_labels_to_expand > 0)
+    if (use_expand != 0 && _num_correlated_labels_to_expand > 0)
     {
         auto it = _label_top_correlations.find(filter_label);
         if (it != _label_top_correlations.end())
@@ -3855,41 +4006,41 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t,
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 // TagT==uint32_t
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search<uint64_t>(
     const float *query, const size_t K, const uint32_t L, uint64_t *indices, float *distances);
@@ -3919,40 +4070,40 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t,
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 // TagT==uint32_t
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const uint32_t use_expand);
 
 } // namespace diskann

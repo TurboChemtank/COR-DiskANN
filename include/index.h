@@ -124,7 +124,51 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     }
 
     // Get converted integer label from string to int map (_label_map)
-    DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label);
+    DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label) const;
+
+    // 【新增接口 - 中文说明】供上层按频率门槛决定是否扩展搜索
+    uint32_t get_filter_frequency_threshold() const override
+    {
+        return _label_frequency_otsu_threshold;
+    }
+
+    uint32_t get_filter_frequency(const std::string &raw_label) const override
+    {
+        auto it = _label_map.find(raw_label);
+        if (it == _label_map.end())
+        {
+            return 0;
+        }
+        const LabelT label = it->second;
+        if (label >= _label_frequency.size())
+        {
+            return 0;
+        }
+        return _label_frequency[label];
+    }
+
+    // 【新增接口实现 - 中文说明】打印频率数组的基本信息（避免输出过多）
+    void check_label_frequency() const override
+    {
+        uint64_t nonzero = 0;
+        uint64_t sum = 0;
+        uint32_t max_freq = 0;
+        for (size_t i = 0; i < _label_frequency.size(); i++)
+        {
+            const uint32_t f = _label_frequency[i];
+            if (f > 0)
+            {
+                nonzero += 1;
+                sum += f;
+                max_freq = std::max(max_freq, f);
+                std::cout<<i<<" "<<f<<std::endl;
+            }
+        }
+
+        diskann::cout << "label_frequency_size=" << _label_frequency.size() << " nonzero=" << nonzero
+                      << " sum=" << sum << " max_freq=" << max_freq
+                      << " otsu_threshold=" << _label_frequency_otsu_threshold << std::endl;
+    }
 
     // Set starting point of an index before inserting any points incrementally.
     // The data count should be equal to _num_frozen_pts * _aligned_dim.
@@ -155,7 +199,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     template <typename IndexType>
     DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> search_with_filters(const T *query, const LabelT &filter_label,
                                                                         const size_t K, const uint32_t L,
-                                                                        IndexType *indices, float *distances);
+                                                                        IndexType *indices, float *distances,
+                                                                        const uint32_t use_expand = 1u);
 
     // Will fail if tag already in the index or if tag=0.
     DISKANN_DLLEXPORT int insert_point(const T *point, const TagT tag);
@@ -220,7 +265,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                                                   std::any &indices, float *distances = nullptr) override;
     virtual std::pair<uint32_t, uint32_t> _search_with_filters(const DataType &query,
                                                                const std::string &filter_label_raw, const size_t K,
-                                                               const uint32_t L, std::any &indices,
+                                                               const uint32_t L, const uint32_t use_expand,
+                                                               std::any &indices,
                                                                float *distances) override;
 
     virtual int _insert_point(const DataType &data_point, const TagType tag) override;
@@ -438,6 +484,10 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 查询时扩展的K
     uint32_t _num_correlated_labels_to_expand{0};
+
+    // 【新增成员 - 中文说明】标签频率数组与Otsu门槛值（门槛值是“频率值”，用于比较 freq<=threshold）
+    std::vector<uint32_t> _label_frequency;
+    uint32_t _label_frequency_otsu_threshold = 0;
 
     // Query scratch data structures
     ConcurrentQueue<InMemQueryScratch<T> *> _query_scratch;

@@ -221,6 +221,24 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
 
     double best_recall = 0.0;
 
+    
+    
+    
+    
+    
+    
+    
+    std::cout<<index->get_filter_frequency_threshold()<<std::endl;
+    std::cout<<"check:\n"<<std::endl;
+    index->check_label_frequency();
+    std::cout<<"check end\n"<<std::endl;
+    
+    
+    
+    
+    
+    
+    
     for (uint32_t test_id = 0; test_id < Lvec.size(); test_id++)
     {
         uint32_t L = Lvec[test_id];
@@ -257,14 +275,26 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             // 3. 执行“OR”查询（新内循环）
             for (const auto &single_label_str : current_query_labels)
             {
+                // 【新增逻辑 - 中文说明】
+                // 先按“标签频率<=门槛值”决定该标签是否启用扩展搜索：
+                // - 低频标签：启用扩展（use_expand=1）
+                // - 高频标签：不扩展（use_expand=0）
+                uint32_t freq = index->get_filter_frequency(single_label_str);
+                uint32_t threshold = index->get_filter_frequency_threshold();
+                
+                // threshold = 8000;
+                
+                const uint32_t use_expand = (freq <= threshold) ? 1u : 0u;
+
                 // 3a. 执行单标签搜索
                 // 显式将查询向量封装为 std::any，避免 any_cast 类型不匹配导致的异常；
                 // 同时用 try/catch 防御 OpenMP 线程内异常导致的进程终止。
                 try
                 {
                     std::any any_query = static_cast<const T *>(query_vec);
-                    auto retval = index->search_with_filters(any_query, single_label_str, recall_at, L, temp_ids.data(),
-                                                             temp_dists.data());
+                    auto retval =
+                        index->search_with_filters(any_query, single_label_str, recall_at, L, use_expand, temp_ids.data(),
+                                                   temp_dists.data());
                     current_cmp_stats += retval.second; // 累加比较次数
                 }
                 catch (const std::bad_any_cast &)
