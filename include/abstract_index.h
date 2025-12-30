@@ -80,12 +80,12 @@ class AbstractIndex
                                                       float *distances);
 
     // 【新增接口 - 中文说明】
-    // 过滤搜索（可按本次调用控制是否启用“相关标签扩展”）。
-    // - use_expand=1：允许在搜索过程中把相关性高的其他标签加入 filter_vec（扩展搜索）
-    // - use_expand=0：只使用单个标签进行搜索（不扩展）
+    // 过滤搜索（可按本次调用控制“相关标签扩展”的数量）。
+    // - expand_num <= 0：不扩展，只使用单个标签进行搜索
+    // - expand_num > 0：从该标签的相关标签列表中取“相关度最高”的前 expand_num 个标签加入 filter_vec（OR 扩展）
     template <typename IndexType>
     std::pair<uint32_t, uint32_t> search_with_filters(const DataType &query, const std::string &raw_label,
-                                                      const size_t K, const uint32_t L, const uint32_t use_expand,
+                                                      const size_t K, const uint32_t L, const int expand_num,
                                                       IndexType *indices, float *distances);
 
     // insert points with labels, labels should be present for filtered index
@@ -132,8 +132,8 @@ class AbstractIndex
     virtual std::pair<uint32_t, uint32_t> _search(const DataType &query, const size_t K, const uint32_t L,
                                                   std::any &indices, float *distances = nullptr) = 0;
     virtual std::pair<uint32_t, uint32_t> _search_with_filters(const DataType &query, const std::string &filter_label,
-                                                               const size_t K, const uint32_t L,
-                                                               const uint32_t use_expand, std::any &indices,
+                                                               const size_t K, const uint32_t L, const int expand_num,
+                                                               std::any &indices,
                                                                float *distances) = 0;
     virtual int _insert_point(const DataType &data_point, const TagType tag, Labelvector &labels) = 0;
     virtual int _insert_point(const DataType &data_point, const TagType tag) = 0;

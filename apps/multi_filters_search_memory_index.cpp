@@ -284,7 +284,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                 
                 // threshold = 8000;
                 
-                const uint32_t use_expand = (freq <= threshold) ? 1u : 0u;
+                const uint32_t use_expand = (freq <= threshold) ? expand_labels_k : 1u;
 
                 // 3a. 执行单标签搜索
                 // 显式将查询向量封装为 std::any，避免 any_cast 类型不匹配导致的异常；

@@ -200,7 +200,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> search_with_filters(const T *query, const LabelT &filter_label,
                                                                         const size_t K, const uint32_t L,
                                                                         IndexType *indices, float *distances,
-                                                                        const uint32_t use_expand = 1u);
+                                                                        const int expand_num = -1);
 
     // Will fail if tag already in the index or if tag=0.
     DISKANN_DLLEXPORT int insert_point(const T *point, const TagT tag);
@@ -265,7 +265,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                                                   std::any &indices, float *distances = nullptr) override;
     virtual std::pair<uint32_t, uint32_t> _search_with_filters(const DataType &query,
                                                                const std::string &filter_label_raw, const size_t K,
-                                                               const uint32_t L, const uint32_t use_expand,
+                                                               const uint32_t L, const int expand_num,
                                                                std::any &indices,
                                                                float *distances) override;
 
