@@ -25,20 +25,14 @@ class IndexWriteParameters
     const uint32_t filter_list_size; // Lf
     // 【新增参数】查询时扩展相关标签的数量（K），默认0表示不扩展
     const uint32_t num_correlated_labels_to_expand;
-    // 【新增参数 - 中文说明】是否启用基于标签相关性的动态剪枝β因子
-    const bool use_label_correlation;
-    // 【新增参数 - 中文说明】β因子影响强度（线性映射幅度），默认1.0
-    const float beta_strength;
 
-    // 【修改构造函数 - 中文说明】增加 use_label_correlation 与 beta_strength
+    // 【修改构造函数 - 中文说明】移除 beta 相关参数（相关度改为剪枝后统计，无法用于建图阶段）
     IndexWriteParameters(const uint32_t search_list_size, const uint32_t max_degree, const bool saturate_graph,
                          const uint32_t max_occlusion_size, const float alpha, const uint32_t num_threads,
-                         const uint32_t filter_list_size, const bool use_label_correlation, const float beta_strength,
-                         const uint32_t num_correlated_labels_to_expand)
+                         const uint32_t filter_list_size, const uint32_t num_correlated_labels_to_expand)
         : search_list_size(search_list_size), max_degree(max_degree), saturate_graph(saturate_graph),
           max_occlusion_size(max_occlusion_size), alpha(alpha), num_threads(num_threads),
-          filter_list_size(filter_list_size), num_correlated_labels_to_expand(num_correlated_labels_to_expand),
-          use_label_correlation(use_label_correlation), beta_strength(beta_strength)
+          filter_list_size(filter_list_size), num_correlated_labels_to_expand(num_correlated_labels_to_expand)
     {
     }
 
@@ -100,20 +94,6 @@ class IndexWriteParametersBuilder
         return *this;
     }
 
-    // 【新增Builder方法 - 中文说明】设置是否启用标签相关性β
-    IndexWriteParametersBuilder &with_use_label_correlation(const bool use_label_correlation)
-    {
-        _use_label_correlation = use_label_correlation;
-        return *this;
-    }
-
-    // 【新增Builder方法 - 中文说明】设置β因子强度
-    IndexWriteParametersBuilder &with_beta_strength(const float beta_strength)
-    {
-        _beta_strength = beta_strength;
-        return *this;
-    }
-
     // 【新增Builder方法】设置查询时标签扩展的K
     IndexWriteParametersBuilder &with_num_correlated_labels_to_expand(const uint32_t k)
     {
@@ -123,17 +103,15 @@ class IndexWriteParametersBuilder
 
     IndexWriteParameters build() const
     {
-        // 【修改build - 中文说明】传递新增的 use_label_correlation 与 beta_strength
+        // 【修改build - 中文说明】移除 beta 相关参数
         return IndexWriteParameters(_search_list_size, _max_degree, _saturate_graph, _max_occlusion_size, _alpha,
-                                    _num_threads, _filter_list_size, _use_label_correlation, _beta_strength,
-                                    _num_correlated_labels_to_expand);
+                                    _num_threads, _filter_list_size, _num_correlated_labels_to_expand);
     }
 
     IndexWriteParametersBuilder(const IndexWriteParameters &wp)
         : _search_list_size(wp.search_list_size), _max_degree(wp.max_degree),
           _max_occlusion_size(wp.max_occlusion_size), _saturate_graph(wp.saturate_graph), _alpha(wp.alpha),
-          _filter_list_size(wp.filter_list_size), _use_label_correlation(wp.use_label_correlation),
-          _beta_strength(wp.beta_strength), _num_correlated_labels_to_expand(wp.num_correlated_labels_to_expand)
+          _filter_list_size(wp.filter_list_size), _num_correlated_labels_to_expand(wp.num_correlated_labels_to_expand)
     {
     }
     IndexWriteParametersBuilder(const IndexWriteParametersBuilder &) = delete;
@@ -147,9 +125,6 @@ class IndexWriteParametersBuilder
     float _alpha{defaults::ALPHA};
     uint32_t _num_threads{defaults::NUM_THREADS};
     uint32_t _filter_list_size{defaults::FILTER_LIST_SIZE};
-    // 【新增Builder存储 - 中文说明】新增参数的默认值
-    bool _use_label_correlation{false};
-    float _beta_strength{1.0f};
     uint32_t _num_correlated_labels_to_expand{0};
 };
 

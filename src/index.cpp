@@ -169,9 +169,6 @@ Index<T, TagT, LabelT>::Index(const IndexConfig &index_config, std::shared_ptr<A
         _indexingThreads = index_config.index_write_params->num_threads;
         _saturate_graph = index_config.index_write_params->saturate_graph;
 
-        // 【新增初始化 - 中文说明】从写入参数读取是否启用标签相关性与β强度
-        _use_label_correlation = index_config.index_write_params->use_label_correlation; // 开关
-        _beta_strength = index_config.index_write_params->beta_strength;                 // 影响幅度
         // 【新增初始化】查询时扩展K
         _num_correlated_labels_to_expand = index_config.index_write_params->num_correlated_labels_to_expand;
 
@@ -485,11 +482,11 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                     out.close();
                 }
 
-                // 4) Label pair co-occurrence count
-                if (!_label_pair_cooccurrence_count.empty())
+                // 4) Label pair edge count (post-prune graph topology)
+                if (!_label_pair_edge_count.empty())
                 {
-                    std::ofstream out(std::string(filename) + "_label_pair_coocc_count.txt");
-                    for (const auto &ra : _label_pair_cooccurrence_count)
+                    std::ofstream out(std::string(filename) + "_label_pair_edge_count.txt");
+                    for (const auto &ra : _label_pair_edge_count)
                     {
                         out << ra.first << '\t';
                         bool first = true;
@@ -889,12 +886,16 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                 }
             }
 
-            // 4) Label pair co-occurrence count
-            std::string coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
-            if (file_exists(coocc_file))
+            // 4) Label pair edge count (post-prune graph topology)
+            // - 新版本优先读取 _label_pair_edge_count.txt
+            // - 兼容旧版本：若没有新文件，则回退读取 _label_pair_coocc_count.txt
+            std::string edge_cnt_file = std::string(filename) + "_label_pair_edge_count.txt";
+            std::string legacy_coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
+            std::string cnt_file_to_read = file_exists(edge_cnt_file) ? edge_cnt_file : legacy_coocc_file;
+            if (file_exists(cnt_file_to_read))
             {
-                _label_pair_cooccurrence_count.clear();
-                std::ifstream in(coocc_file);
+                _label_pair_edge_count.clear();
+                std::ifstream in(cnt_file_to_read);
                 std::string line;
                 while (std::getline(in, line))
                 {
@@ -918,7 +919,7 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                                 continue;
                             LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
                             uint64_t c = (uint64_t)std::stoull(pair_tok.substr(comma_pos + 1));
-                            _label_pair_cooccurrence_count[a][b] = c;
+                            _label_pair_edge_count[a][b] = c;
                         }
                     }
                 }
@@ -1455,18 +1456,6 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
                     continue;
 
                 float djk = _data_store->get_distance(iter2->id, iter->id);
-                // 【新增β逻辑 - 中文说明】若启用标签相关性，则根据两个候选点的标签相似度计算β，调整djk
-                // β映射方式：beta = 1.0 + beta_strength * (corr - 0.5f) * 2  -> 将[0,1]映射到 [1-beta_strength,
-                // 1+beta_strength]
-                if (_use_label_correlation && _filtered_index && _beta_strength != 0.0f)
-                {
-                    float corr = compute_max_label_correlation(iter->id, iter2->id);
-                    // 将相关性线性映射到β范围，保证β始终为正值
-                    float beta = 1.0f + _beta_strength * (corr - 0.5f) * 2.0f;
-                    if (beta < 0.1f)
-                        beta = 0.1f;  // 防止过小导致数值不稳定
-                    djk = djk / beta; // 使用β缩放几何距离
-                }
                 if (_dist_metric == diskann::Metric::L2 || _dist_metric == diskann::Metric::COSINE)
                 {
                     occlude_factor[t] = (djk == 0) ? std::numeric_limits<float>::max()
@@ -1488,7 +1477,8 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
     }
 }
 
-// 【新增实现 - 中文说明】计算标签相关性矩阵（Ochiai）：统计每个标签出现次数与两标签共现次数
+// 【修改实现 - 中文说明】
+// 计算标签相关性矩阵（Ochiai）：cnt(ab) 改为“剪枝后图中通过拓扑边连接的次数”
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
 {
     // 仅在启用过滤索引且标签数据可用时计算
@@ -1496,71 +1486,76 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
         return;
     _label_correlation_matrix.clear();
 
-    // 统计每个标签的出现次数
+    // 1) cnt(a)：仍按“标签在数据点上出现次数”统计（不包含 frozen points）
     std::unordered_map<LabelT, uint64_t> label_counts;
-    // 统计标签对的共现次数（只统计有共现的对）
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> co_occurrence_counts;
-
-    // std::cout<<"_nd: "<<_nd<<std::endl;
-
-    int num3 = 0;
-
-    // std::cout<<"location_to_labels.size(): "<<_location_to_labels.size()<<std::endl;
-
-    for (uint32_t point_id = 0; point_id < _location_to_labels.size(); ++point_id)
+    const uint32_t real_points = static_cast<uint32_t>(_max_points);
+    for (uint32_t point_id = 0; point_id < real_points && point_id < _location_to_labels.size(); ++point_id)
     {
-        num3++;
         const auto &labels = _location_to_labels[point_id];
-        // 对每个标签计数
         for (const auto &la : labels)
         {
             label_counts[la] += 1;
         }
-        // 对标签对计数（双向、对称）
-        for (size_t i = 0; i < labels.size(); ++i)
+    }
+
+    // 2) cnt(ab)：剪枝后图中“拓扑边”连接次数（对称累计）
+    // - 对每条有向边 u->v，遍历 labels(u) × labels(v)，对 (a,b) 累加 1（并对称写入 b->a）
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> edge_counts;
+    for (uint32_t u = 0; u < real_points; ++u)
+    {
+        if (u >= _location_to_labels.size())
+            break;
+        const auto &lu = _location_to_labels[u];
+        if (lu.empty())
+            continue;
+        const auto &nghrs = _graph_store->get_neighbours((location_t)u);
+        for (const auto &v_loc : nghrs)
         {
-            for (size_t j = i + 1; j < labels.size(); ++j)
+            const uint32_t v = (uint32_t)v_loc;
+            if (v >= real_points || v == u)
+                continue;
+            if (v >= _location_to_labels.size())
+                continue;
+            const auto &lv = _location_to_labels[v];
+            if (lv.empty())
+                continue;
+            for (const auto &a : lu)
             {
-                LabelT a = labels[i];
-                LabelT b = labels[j];
-                co_occurrence_counts[a][b] += 1;
-                co_occurrence_counts[b][a] += 1;
+                for (const auto &b : lv)
+                {
+                    if (a == b)
+                        continue;
+                    edge_counts[a][b] += 1;
+                    edge_counts[b][a] += 1;
+                }
             }
         }
     }
-    // std::cout<<"num3: "<<num3<<std::endl;
 
-    // 将统计缓存至成员，供后续增量更新使用
-    _label_occurrence_count = label_counts;
-    _label_pair_cooccurrence_count = co_occurrence_counts;
+    // 将统计缓存至成员，供后续增量更新/持久化使用
+    _label_occurrence_count = std::move(label_counts);
+    _label_pair_edge_count = std::move(edge_counts);
 
-    // 计算Ochiai相关性：co_occ / sqrt(cntA * cntB)
-
-    int num1 = 0;
-
-    for (const auto &kvA : co_occurrence_counts)
+    // 3) 计算 Ochiai：cnt(ab) / sqrt(cnt(a) * cnt(b))
+    for (const auto &kvA : _label_pair_edge_count)
     {
-
-        num1++;
-
-        LabelT a = kvA.first;
-        auto cntA_it = label_counts.find(a);
-        if (cntA_it == label_counts.end() || cntA_it->second == 0)
+        const LabelT a = kvA.first;
+        auto cntA_it = _label_occurrence_count.find(a);
+        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
             continue;
         for (const auto &kvB : kvA.second)
         {
-            LabelT b = kvB.first;
-            auto cntB_it = label_counts.find(b);
-            if (cntB_it == label_counts.end() || cntB_it->second == 0)
+            const LabelT b = kvB.first;
+            auto cntB_it = _label_occurrence_count.find(b);
+            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
                 continue;
-            double co = static_cast<double>(kvB.second);
-            double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
-            float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
+            const double co = static_cast<double>(kvB.second);
+            const double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
+            const float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
             _label_correlation_matrix[a][b] = s;
             _label_correlation_matrix[b][a] = s;
         }
     }
-    // std::cout<<"num1: "<<num1<<std::endl;
 }
 
 // 计算每个标签的Top-K相关标签列表（降序），存入 _label_top_correlations
@@ -1601,72 +1596,12 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
 {
-    if (!_filtered_index || !_use_label_correlation)
+    // 【修改说明】cnt(ab) 基于“剪枝后图边”，很难在增量插入时做局部更新；
+    // 这里直接全量重算，保证语义正确（性能如需优化可后续再做）。
+    if (!_filtered_index || _num_correlated_labels_to_expand == 0)
         return;
-    // 更新出现次数
-    for (const auto &la : labels)
-        _label_occurrence_count[la] += 1;
-    // 更新共现次数（对称）
-    for (size_t i = 0; i < labels.size(); ++i)
-    {
-        for (size_t j = i + 1; j < labels.size(); ++j)
-        {
-            LabelT a = labels[i];
-            LabelT b = labels[j];
-            _label_pair_cooccurrence_count[a][b] += 1;
-            _label_pair_cooccurrence_count[b][a] += 1;
-        }
-    }
-    // 仅重算与本次标签相关的矩阵条目
-    for (const auto &a : labels)
-    {
-        auto cntA_it = _label_occurrence_count.find(a);
-        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
-            continue;
-        for (const auto &b : labels)
-        {
-            if (a == b)
-                continue;
-            auto cntB_it = _label_occurrence_count.find(b);
-            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
-                continue;
-            double co = (double)_label_pair_cooccurrence_count[a][b];
-            double score = co / std::sqrt((double)cntA_it->second * (double)cntB_it->second);
-            float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
-            _label_correlation_matrix[a][b] = s;
-            _label_correlation_matrix[b][a] = s;
-        }
-    }
-}
-
-// 【新增实现 - 中文说明】返回两个点的标签集合之间的最大相关性分数（若无标签或无共现则为0）
-template <typename T, typename TagT, typename LabelT>
-float Index<T, TagT, LabelT>::compute_max_label_correlation(uint32_t a, uint32_t b) const
-{
-    if (a >= _location_to_labels.size() || b >= _location_to_labels.size())
-        return 0.0f;
-    const auto &la = _location_to_labels[a];
-    const auto &lb = _location_to_labels[b];
-    if (la.empty() || lb.empty())
-        return 0.0f;
-    float best = 0.0f;
-    for (const auto &xa : la)
-    {
-        auto itA = _label_correlation_matrix.find(xa);
-        if (itA == _label_correlation_matrix.end())
-            continue;
-        const auto &row = itA->second;
-        for (const auto &xb : lb)
-        {
-            auto it = row.find(xb);
-            if (it != row.end())
-            {
-                if (it->second > best)
-                    best = it->second;
-            }
-        }
-    }
-    return best;
+    (void)labels;
+    calculate_label_correlations();
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -2496,16 +2431,14 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
 
     std::cout << "ok checked" << std::endl;
 
-    // 【新增调用 - 中文说明】在开始建图前计算标签相关性矩阵（用于β或查询标签扩展）
-    if (_use_label_correlation || _num_correlated_labels_to_expand > 0)
+    this->build(filename, num_points_to_load, tags);
+
+    // 【修改调用 - 中文说明】相关性改为“剪枝后图”统计，因此在 build() 完成后再计算
+    if (_num_correlated_labels_to_expand > 0)
     {
         calculate_label_correlations();
-        // 计算Top-K相关标签
-        std::cout << "ok checked2" << std::endl;
         compute_top_k_label_correlations();
     }
-
-    this->build(filename, num_points_to_load, tags);
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -3512,7 +3445,7 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
 
         _location_to_labels[location] = labels;
         // 【新增增量更新 - 中文说明】插入新点后，增量刷新标签相关性统计与矩阵
-        if (_use_label_correlation || _num_correlated_labels_to_expand > 0)
+        if (_num_correlated_labels_to_expand > 0)
         {
             update_label_correlations_incremental(labels);
             compute_top_k_label_correlations();

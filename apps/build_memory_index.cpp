@@ -28,9 +28,6 @@ int main(int argc, char **argv)
     uint32_t num_threads, R, L, Lf, build_PQ_bytes;
     float alpha;
     bool use_pq_build, use_opq;
-    // 【新增参数 - 中文说明】是否启用基于标签相关性的β剪枝与其强度
-    bool use_label_correlation = false; // 启用β
-    float beta_strength = 1.0f;         // β强度
     // 【新增参数】查询时扩展的相关标签个数K（默认0不扩展）
     uint32_t expand_labels_k = 0;
 
@@ -76,11 +73,6 @@ int main(int argc, char **argv)
         optional_configs.add_options()("label_type", po::value<std::string>(&label_type)->default_value("uint"),
                                        program_options_utils::LABEL_TYPE_DESCRIPTION);
 
-        // 【新增可选参数 - 中文说明】启用β剪枝与β强度（仅在过滤索引下生效）
-        optional_configs.add_options()("use_label_correlation", po::bool_switch()->default_value(false),
-                                       "Enable beta factor based on label correlation (filtered index only)");
-        optional_configs.add_options()("beta_strength", po::value<float>(&beta_strength)->default_value(1.0f),
-                                       "Strength of beta factor influence (default 1.0)");
         // 【新增可选参数】查询时扩展Top-K相关标签
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
@@ -98,8 +90,6 @@ int main(int argc, char **argv)
         po::notify(vm);
         use_pq_build = (build_PQ_bytes > 0);
         use_opq = vm["use_opq"].as<bool>();
-        // 【新增读取 - 中文说明】读取β相关CLI参数
-        use_label_correlation = vm["use_label_correlation"].as<bool>();
     }
     catch (const std::exception &ex)
     {
@@ -141,9 +131,6 @@ int main(int argc, char **argv)
                                       .with_alpha(alpha)
                                       .with_saturate_graph(false)
                                       .with_num_threads(num_threads)
-                                      // 【新增传递 - 中文说明】将CLI参数传递到构建参数中
-                                      .with_use_label_correlation(use_label_correlation)
-                                      .with_beta_strength(beta_strength)
                                       .with_num_correlated_labels_to_expand(expand_labels_k)
                                       .build();
 

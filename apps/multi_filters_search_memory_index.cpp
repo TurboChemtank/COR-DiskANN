@@ -100,8 +100,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                         const uint32_t recall_at, const bool print_all_recalls, const std::vector<uint32_t> &Lvec,
                         const bool dynamic, const bool tags, const bool show_qps_per_thread,
                         const std::string &query_filters_file, // 修改：接收文件路径
-                        const float fail_if_recall_below, const uint32_t expand_labels_k,
-                        const bool use_label_correlation, const float beta_strength)
+                        const float fail_if_recall_below, const uint32_t expand_labels_k)
 {
     using TagT = uint32_t;
     using IdType = uint32_t; // 内存索引通常使用 uint32_t 作为ID
@@ -136,13 +135,11 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     // - 读取图头，确定冻点数量等；随后 load() 载入数据与图
     const size_t num_frozen_pts = diskann::get_graph_num_frozen_points(index_path);
 
-    // 写入参数：用于启用 β 与查询时标签扩展K
+    // 写入参数：仅用于“查询时标签扩展K”
     auto write_params =
         diskann::IndexWriteParametersBuilder(diskann::defaults::SEARCH_LIST_SIZE, diskann::defaults::MAX_DEGREE)
             .with_num_threads(num_threads)
             .with_filter_list_size(diskann::defaults::FILTER_LIST_SIZE)
-            .with_use_label_correlation(use_label_correlation)
-            .with_beta_strength(beta_strength)
             .with_num_correlated_labels_to_expand(expand_labels_k)
             .build();
 
@@ -419,8 +416,6 @@ int main(int argc, char **argv)
     bool print_all_recalls, dynamic, tags, show_qps_per_thread;
     float fail_if_recall_below = 0.0f;
     uint32_t expand_labels_k = 0;
-    bool use_label_correlation = false;
-    float beta_strength = 1.0f;
 
     po::options_description desc{program_options_utils::make_program_description(
         "multi_filters_search_memory_index", "Searches in-memory DiskANN indexes with multi-label 'OR' logic")};
@@ -470,10 +465,6 @@ int main(int argc, char **argv)
         // 标签相关性与查询扩展
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
-        optional_configs.add_options()("use_label_correlation", po::bool_switch(&use_label_correlation),
-                                       "Enable beta-based label correlation during search (default off)");
-        optional_configs.add_options()("beta_strength", po::value<float>(&beta_strength)->default_value(1.0f),
-                                       "Strength of beta factor for label correlation (default 1.0)");
 
         // Output controls
         po::options_description output_controls("Output controls");
@@ -553,23 +544,23 @@ int main(int argc, char **argv)
             {
                 return search_memory_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
-                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
-                    use_label_correlation, beta_strength);
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
+                    expand_labels_k);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
-                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
-                    use_label_correlation, beta_strength);
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
+                    expand_labels_k);
             }
             else if (data_type == std::string("float"))
             {
                 std::cout << "check1" << std::endl;
                 return search_memory_index<float, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
-                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below, expand_labels_k,
-                    use_label_correlation, beta_strength);
+                    Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
+                    expand_labels_k);
             }
             else
             {
@@ -584,21 +575,21 @@ int main(int argc, char **argv)
                 return search_memory_index<int8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                    num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                    show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                   expand_labels_k, use_label_correlation, beta_strength);
+                                                   expand_labels_k);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                     num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                     show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                    expand_labels_k, use_label_correlation, beta_strength);
+                                                    expand_labels_k);
             }
             else if (data_type == std::string("float"))
             {
                 return search_memory_index<float>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                   num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                   show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                  expand_labels_k, use_label_correlation, beta_strength);
+                                                  expand_labels_k);
             }
             else
             {

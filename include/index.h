@@ -341,9 +341,6 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 【新增声明 - 中文说明】计算标签相关性的内部方法，在构建过滤索引前调用
     void calculate_label_correlations();
 
-    // 【新增声明 - 中文说明】根据两个点的标签计算两者的最大标签相关性分数（Ochiai），用于映射到β
-    float compute_max_label_correlation(uint32_t a, uint32_t b) const;
-
     // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
     void update_label_correlations_incremental(const std::vector<LabelT> &labels);
 
@@ -459,10 +456,6 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t _filterIndexingQueueSize;
     std::unordered_map<std::string, LabelT> _label_map;
 
-    // 【新增成员 - 中文说明】是否启用标签相关性β；β影响强度
-    bool _use_label_correlation = false; // 开关
-    float _beta_strength = 1.0f;         // 线性映射幅度
-
     // 【新增成员 - 中文说明】标签相关性矩阵：存储任意两个标签的相关性分数（对称）
     // 采用嵌套map: labelA -> (labelB -> score)
     std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
@@ -472,8 +465,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>>
-        _label_pair_cooccurrence_count; // co(labelA,labelB)
+    // cnt(labelA,labelB)：剪枝后图中“拓扑边”产生的连接次数（对称累计）
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> _label_pair_edge_count;
 
     // Indexing parameters
     uint32_t _indexingQueueSize;

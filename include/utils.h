@@ -6,6 +6,7 @@
 #include <errno.h>
 
 #include "common_includes.h"
+#include <filesystem>
 
 #ifdef __APPLE__
 #else
@@ -182,8 +183,28 @@ inline void convert_labels_string_to_int(const std::string &inFileName, const st
                                          const std::string &mapFileName, const std::string &unv_label)
 {
     std::unordered_map<std::string, uint32_t> string_int_map;
-    std::ofstream label_writer(outFileName);
+    // 【健壮性增强 - 中文说明】确保输出目录存在；否则后续写文件会静默失败，最终在读 label_formatted 时崩溃
+    {
+        const auto out_parent = std::filesystem::path(outFileName).parent_path();
+        if (!out_parent.empty())
+            std::filesystem::create_directories(out_parent);
+        const auto map_parent = std::filesystem::path(mapFileName).parent_path();
+        if (!map_parent.empty())
+            std::filesystem::create_directories(map_parent);
+    }
+
     std::ifstream label_reader(inFileName);
+    if (!label_reader.is_open())
+    {
+        throw diskann::ANNException(std::string("Failed to open file ") + inFileName, -1, __FUNCSIG__, __FILE__,
+                                    __LINE__);
+    }
+    std::ofstream label_writer(outFileName);
+    if (!label_writer.is_open())
+    {
+        throw diskann::ANNException(std::string("Failed to open file ") + outFileName, -1, __FUNCSIG__, __FILE__,
+                                    __LINE__);
+    }
     if (unv_label != "")
         string_int_map[unv_label] = 0; // if universal label is provided map it to 0 always
     std::string line, token;
@@ -218,6 +239,11 @@ inline void convert_labels_string_to_int(const std::string &inFileName, const st
     label_writer.close();
 
     std::ofstream map_writer(mapFileName);
+    if (!map_writer.is_open())
+    {
+        throw diskann::ANNException(std::string("Failed to open file ") + mapFileName, -1, __FUNCSIG__, __FILE__,
+                                    __LINE__);
+    }
     for (auto mp : string_int_map)
     {
         map_writer << mp.first << "\t" << mp.second << std::endl;
