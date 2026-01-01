@@ -482,11 +482,11 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                     out.close();
                 }
 
-                // 4) Label pair edge count (post-prune graph topology)
-                if (!_label_pair_edge_count.empty())
+                // 4) Label pair co-occurrence count
+                if (!_label_pair_cooccurrence_count.empty())
                 {
-                    std::ofstream out(std::string(filename) + "_label_pair_edge_count.txt");
-                    for (const auto &ra : _label_pair_edge_count)
+                    std::ofstream out(std::string(filename) + "_label_pair_coocc_count.txt");
+                    for (const auto &ra : _label_pair_cooccurrence_count)
                     {
                         out << ra.first << '\t';
                         bool first = true;
@@ -886,15 +886,15 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                 }
             }
 
-            // 4) Label pair edge count (post-prune graph topology)
-            // - 新版本优先读取 _label_pair_edge_count.txt
-            // - 兼容旧版本：若没有新文件，则回退读取 _label_pair_coocc_count.txt
-            std::string edge_cnt_file = std::string(filename) + "_label_pair_edge_count.txt";
-            std::string legacy_coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
-            std::string cnt_file_to_read = file_exists(edge_cnt_file) ? edge_cnt_file : legacy_coocc_file;
+            // 4) Label pair co-occurrence count
+            // - 优先读取 _label_pair_coocc_count.txt
+            // - 兼容旧版本：若没有该文件，则回退读取 _label_pair_edge_count.txt
+            std::string coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
+            std::string legacy_edge_file = std::string(filename) + "_label_pair_edge_count.txt";
+            std::string cnt_file_to_read = file_exists(coocc_file) ? coocc_file : legacy_edge_file;
             if (file_exists(cnt_file_to_read))
             {
-                _label_pair_edge_count.clear();
+                _label_pair_cooccurrence_count.clear();
                 std::ifstream in(cnt_file_to_read);
                 std::string line;
                 while (std::getline(in, line))
@@ -919,7 +919,7 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                                 continue;
                             LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
                             uint64_t c = (uint64_t)std::stoull(pair_tok.substr(comma_pos + 1));
-                            _label_pair_edge_count[a][b] = c;
+                            _label_pair_cooccurrence_count[a][b] = c;
                         }
                     }
                 }
@@ -1478,7 +1478,7 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
 }
 
 // 【修改实现 - 中文说明】
-// 计算标签相关性矩阵（Ochiai）：cnt(ab) 改为“剪枝后图中通过拓扑边连接的次数”
+// 计算标签相关性矩阵（Ochiai）：cnt(ab) 使用“同一条向量中标签对共同出现次数”
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
 {
     // 仅在启用过滤索引且标签数据可用时计算
@@ -1486,8 +1486,9 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
         return;
     _label_correlation_matrix.clear();
 
-    // 1) cnt(a)：仍按“标签在数据点上出现次数”统计（不包含 frozen points）
+    // 1) 统计 cnt(a) 与 cnt(ab)（同向量共现）
     std::unordered_map<LabelT, uint64_t> label_counts;
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> co_occurrence_counts;
     const uint32_t real_points = static_cast<uint32_t>(_max_points);
     for (uint32_t point_id = 0; point_id < real_points && point_id < _location_to_labels.size(); ++point_id)
     {
@@ -1496,48 +1497,26 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
         {
             label_counts[la] += 1;
         }
-    }
-
-    // 2) cnt(ab)：剪枝后图中“拓扑边”连接次数（对称累计）
-    // - 对每条有向边 u->v，遍历 labels(u) × labels(v)，对 (a,b) 累加 1（并对称写入 b->a）
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> edge_counts;
-    for (uint32_t u = 0; u < real_points; ++u)
-    {
-        if (u >= _location_to_labels.size())
-            break;
-        const auto &lu = _location_to_labels[u];
-        if (lu.empty())
-            continue;
-        const auto &nghrs = _graph_store->get_neighbours((location_t)u);
-        for (const auto &v_loc : nghrs)
+        for (size_t i = 0; i < labels.size(); ++i)
         {
-            const uint32_t v = (uint32_t)v_loc;
-            if (v >= real_points || v == u)
-                continue;
-            if (v >= _location_to_labels.size())
-                continue;
-            const auto &lv = _location_to_labels[v];
-            if (lv.empty())
-                continue;
-            for (const auto &a : lu)
+            for (size_t j = i + 1; j < labels.size(); ++j)
             {
-                for (const auto &b : lv)
-                {
-                    if (a == b)
-                        continue;
-                    edge_counts[a][b] += 1;
-                    edge_counts[b][a] += 1;
-                }
+                const LabelT a = labels[i];
+                const LabelT b = labels[j];
+                if (a == b)
+                    continue;
+                co_occurrence_counts[a][b] += 1;
+                co_occurrence_counts[b][a] += 1;
             }
         }
     }
 
     // 将统计缓存至成员，供后续增量更新/持久化使用
     _label_occurrence_count = std::move(label_counts);
-    _label_pair_edge_count = std::move(edge_counts);
+    _label_pair_cooccurrence_count = std::move(co_occurrence_counts);
 
-    // 3) 计算 Ochiai：cnt(ab) / sqrt(cnt(a) * cnt(b))
-    for (const auto &kvA : _label_pair_edge_count)
+    // 2) 计算 Ochiai：cnt(ab) / sqrt(cnt(a) * cnt(b))
+    for (const auto &kvA : _label_pair_cooccurrence_count)
     {
         const LabelT a = kvA.first;
         auto cntA_it = _label_occurrence_count.find(a);
@@ -1596,12 +1575,44 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
 {
-    // 【修改说明】cnt(ab) 基于“剪枝后图边”，很难在增量插入时做局部更新；
-    // 这里直接全量重算，保证语义正确（性能如需优化可后续再做）。
     if (!_filtered_index || _num_correlated_labels_to_expand == 0)
         return;
-    (void)labels;
-    calculate_label_correlations();
+    // 更新出现次数
+    for (const auto &la : labels)
+        _label_occurrence_count[la] += 1;
+    // 更新共现次数（对称）
+    for (size_t i = 0; i < labels.size(); ++i)
+    {
+        for (size_t j = i + 1; j < labels.size(); ++j)
+        {
+            const LabelT a = labels[i];
+            const LabelT b = labels[j];
+            if (a == b)
+                continue;
+            _label_pair_cooccurrence_count[a][b] += 1;
+            _label_pair_cooccurrence_count[b][a] += 1;
+        }
+    }
+    // 局部刷新相关性矩阵（只重算与本次标签相关的条目）
+    for (const auto &a : labels)
+    {
+        auto cntA_it = _label_occurrence_count.find(a);
+        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
+            continue;
+        for (const auto &b : labels)
+        {
+            if (a == b)
+                continue;
+            auto cntB_it = _label_occurrence_count.find(b);
+            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
+                continue;
+            const double co = static_cast<double>(_label_pair_cooccurrence_count[a][b]);
+            const double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
+            const float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
+            _label_correlation_matrix[a][b] = s;
+            _label_correlation_matrix[b][a] = s;
+        }
+    }
 }
 
 template <typename T, typename TagT, typename LabelT>
