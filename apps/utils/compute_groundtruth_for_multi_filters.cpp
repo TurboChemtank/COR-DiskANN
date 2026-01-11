@@ -7,6 +7,8 @@
 #include <vector>
 #include <set>
 #include <algorithm>
+#include <queue>
+#include <limits>
 #include <boost/program_options.hpp>
 
 #include "index.h"
@@ -165,7 +167,7 @@ bool check_label_set_intersection(const std::vector<LabelT> &query_labels, const
 }
 
 template <typename T>
-void compute_groundtruth(const std::string &data_type, const std::string &dist_fn, const std::string &base_file,
+void compute_groundtruth(const std::string &data_type, const std::string &dist_fn, const std::string &index_path,
                          const std::string &query_file, const std::string &gt_file, const uint32_t K,
                          const std::string &label_file, const std::string &universal_label_str,
                          const std::string &query_filters_file)
@@ -180,10 +182,22 @@ void compute_groundtruth(const std::string &data_type, const std::string &dist_f
     else
         throw diskann::ANNException("Unknown distance function", -1, __FUNCSIG__, __FILE__, __LINE__);
 
-    // 加载基础数据
+    // 从索引读取基础数据（而不是从原始 base_file 读取）
+    // - 内存索引默认会把向量保存到 {index_path}.data
+    // - 这样能保证“只对索引实际包含的点集合”计算 GT，避免索引只构建了子集时 GT 与可检索集合不一致
     T *base_data = nullptr;
-    size_t npts, ndim;
-    diskann::load_bin<T>(base_file, base_data, npts, ndim);
+    size_t npts_with_frozen = 0, ndim = 0;
+    const std::string index_data_file = index_path + ".data";
+    diskann::load_bin<T>(index_data_file, base_data, npts_with_frozen, ndim);
+
+    // 处理 frozen points：索引数据文件中可能包含 frozen points（导航点），这些点不属于真实数据集
+    const size_t num_frozen_pts = diskann::Index<T>::get_graph_num_frozen_points(index_path);
+    if (npts_with_frozen < num_frozen_pts)
+    {
+        throw diskann::ANNException("Index .data points < num_frozen_pts, index files may be corrupted", -1, __FUNCSIG__,
+                                    __FILE__, __LINE__);
+    }
+    const size_t npts = npts_with_frozen - num_frozen_pts;
 
     // 加载查询数据
     T *query_data = nullptr;
@@ -310,7 +324,7 @@ void compute_groundtruth(const std::string &data_type, const std::string &dist_f
 
 int main(int argc, char **argv)
 {
-    std::string data_type, dist_fn, base_file, query_file, gt_file, label_file, universal_label, query_filters_file,
+    std::string data_type, dist_fn, index_path, query_file, gt_file, label_file, universal_label, query_filters_file,
         label_type;
     uint32_t K;
 
@@ -326,16 +340,14 @@ int main(int argc, char **argv)
                                        program_options_utils::DATA_TYPE_DESCRIPTION);
         required_configs.add_options()("dist_fn", po::value<std::string>(&dist_fn)->required(),
                                        program_options_utils::DISTANCE_FUNCTION_DESCRIPTION);
-        required_configs.add_options()("base_file", po::value<std::string>(&base_file)->required(),
-                                       "File containing the base vectors in binary format");
+        required_configs.add_options()("index_path", po::value<std::string>(&index_path)->required(),
+                                       "Path prefix of the DiskANN index (expects <index_path>.data, <index_path> etc.)");
         required_configs.add_options()("query_file", po::value<std::string>(&query_file)->required(),
                                        program_options_utils::QUERY_FILE_DESCRIPTION);
         required_configs.add_options()("gt_file", po::value<std::string>(&gt_file)->required(),
                                        program_options_utils::GROUND_TRUTH_FILE_DESCRIPTION);
         required_configs.add_options()("recall_at,K", po::value<uint32_t>(&K)->required(),
                                        program_options_utils::NUMBER_OF_RESULTS_DESCRIPTION);
-        required_configs.add_options()("label_file", po::value<std::string>(&label_file)->required(),
-                                       "Path to label file for base data");
         required_configs.add_options()(
             "query_filters_file", po::value<std::string>(&query_filters_file)->required(),
             "Path to query filters file. Each line contains comma-separated labels for the corresponding query.");
@@ -344,6 +356,9 @@ int main(int argc, char **argv)
         po::options_description optional_configs("Optional");
         optional_configs.add_options()("universal_label", po::value<std::string>(&universal_label)->default_value(""),
                                        program_options_utils::UNIVERSAL_LABEL);
+        // 若不显式传 label_file，则默认使用索引旁边的 {index_path}_labels.txt
+        optional_configs.add_options()("label_file", po::value<std::string>(&label_file)->default_value(""),
+                                       "Path to label file for base data (default: <index_path>_labels.txt)");
         optional_configs.add_options()("label_type", po::value<std::string>(&label_type)->default_value("uint"),
                                        program_options_utils::LABEL_TYPE_DESCRIPTION);
 
@@ -366,16 +381,20 @@ int main(int argc, char **argv)
 
     try
     {
+        if (label_file.empty())
+        {
+            label_file = index_path + "_labels.txt";
+        }
         // label_type 在本工具中不再影响流程（使用字符串标签比对）
         {
             if (data_type == "float")
-                compute_groundtruth<float>(data_type, dist_fn, base_file, query_file, gt_file, K, label_file,
+                compute_groundtruth<float>(data_type, dist_fn, index_path, query_file, gt_file, K, label_file,
                                            universal_label, query_filters_file);
             else if (data_type == "int8")
-                compute_groundtruth<int8_t>(data_type, dist_fn, base_file, query_file, gt_file, K, label_file,
+                compute_groundtruth<int8_t>(data_type, dist_fn, index_path, query_file, gt_file, K, label_file,
                                             universal_label, query_filters_file);
             else if (data_type == "uint8")
-                compute_groundtruth<uint8_t>(data_type, dist_fn, base_file, query_file, gt_file, K, label_file,
+                compute_groundtruth<uint8_t>(data_type, dist_fn, index_path, query_file, gt_file, K, label_file,
                                              universal_label, query_filters_file);
             else
             {

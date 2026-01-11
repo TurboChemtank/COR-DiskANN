@@ -338,11 +338,11 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                       const uint32_t maxc, std::vector<uint32_t> &result, InMemQueryScratch<T> *scratch,
                       const tsl::robin_set<uint32_t> *const delete_set_ptr = nullptr);
 
-    // 【新增声明 - 中文说明】计算标签相关性的内部方法，在构建过滤索引前调用
+    // 【新增声明 - 中文说明】计算标签的 centroid（均值向量）统计信息，用于后续生成 Top-K 相似标签
     void calculate_label_correlations();
 
-    // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
-    void update_label_correlations_incremental(const std::vector<LabelT> &labels);
+    // 【新增声明 - 中文说明】增量插入时，使用新点向量与其标签更新 centroid 统计
+    void update_label_correlations_incremental(const T *point, const std::vector<LabelT> &labels);
 
     // add reverse links from all the visited nodes to node n.
     void inter_insert(uint32_t n, std::vector<uint32_t> &pruned_list, const uint32_t range,
@@ -460,8 +460,16 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 采用嵌套map: labelA -> (labelB -> score)
     std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
 
-    // 每个标签的Top-K相关标签列表
+    // 每个标签的Top-K相似标签列表（由 centroid 距离/相似度生成，按分数从高到低排序）
     std::unordered_map<LabelT, std::vector<std::pair<float, LabelT>>> _label_top_correlations;
+
+    // 【新增成员 - 中文说明】标签 centroid 统计（sum/count），用于计算 centroid 间的距离/相似度
+    // - _label_centroid_sum: 扁平数组，按 [label_id * aligned_dim + d] 存储 sum
+    // - _label_centroid_count: 每个 label 的计数
+    // 注意：这里的 aligned_dim 以 data_store 的 aligned_dim 为准（不足 _dim 的部分视作 0）
+    std::vector<float> _label_centroid_sum;
+    std::vector<uint32_t> _label_centroid_count;
+    size_t _label_centroid_aligned_dim = 0;
 
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)

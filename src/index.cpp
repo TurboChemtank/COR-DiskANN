@@ -1478,140 +1478,215 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
 }
 
 // 【修改实现 - 中文说明】
-// 计算标签相关性矩阵（Ochiai）：cnt(ab) 使用“同一条向量中标签对共同出现次数”
+// 由“标签共现(Ochiai)”改为“标签 centroid 距离/相似度”：
+// - centroid(label) = mean(该标签下所有点的向量)
+// - Top-K 相似标签：对每个 label，找到 centroid 最接近（或相似度最高）的 K 个其它 label
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
 {
     // 仅在启用过滤索引且标签数据可用时计算
     if (!_filtered_index)
         return;
+    // 清空旧的 Ochiai 相关性缓存（保留字段但不再使用）
     _label_correlation_matrix.clear();
+    _label_occurrence_count.clear();
+    _label_pair_cooccurrence_count.clear();
 
-    // 1) 统计 cnt(a) 与 cnt(ab)（同向量共现）
-    std::unordered_map<LabelT, uint64_t> label_counts;
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> co_occurrence_counts;
-    const uint32_t real_points = static_cast<uint32_t>(_max_points);
-    for (uint32_t point_id = 0; point_id < real_points && point_id < _location_to_labels.size(); ++point_id)
+    // 计算最大标签值，用于分配 centroid 的 sum/count 数组
+    LabelT max_label = 0;
+    for (auto itr = _labels.begin(); itr != _labels.end(); ++itr)
     {
-        const auto &labels = _location_to_labels[point_id];
-        for (const auto &la : labels)
-        {
-            label_counts[la] += 1;
-        }
-        for (size_t i = 0; i < labels.size(); ++i)
-        {
-            for (size_t j = i + 1; j < labels.size(); ++j)
-            {
-                const LabelT a = labels[i];
-                const LabelT b = labels[j];
-                if (a == b)
-                    continue;
-                co_occurrence_counts[a][b] += 1;
-                co_occurrence_counts[b][a] += 1;
-            }
-        }
+        const LabelT lbl = *itr;
+        if (_use_universal_label && lbl == _universal_label)
+            continue;
+        max_label = std::max(max_label, lbl);
     }
 
-    // 将统计缓存至成员，供后续增量更新/持久化使用
-    _label_occurrence_count = std::move(label_counts);
-    _label_pair_cooccurrence_count = std::move(co_occurrence_counts);
+    const size_t aligned_dim = _data_store->get_aligned_dim();
+    _label_centroid_aligned_dim = aligned_dim;
+    _label_centroid_sum.assign(((size_t)max_label + 1) * aligned_dim, 0.0f);
+    _label_centroid_count.assign((size_t)max_label + 1, 0);
 
-    // 2) 计算 Ochiai：cnt(ab) / sqrt(cnt(a) * cnt(b))
-    for (const auto &kvA : _label_pair_cooccurrence_count)
+    // 用于暂存单个点的向量（aligned_dim）
+    std::vector<T> tmp_vec(aligned_dim);
+
+    // 注意：只统计真实点（不含 frozen points），并以 location_to_labels 为准做边界保护
+    const uint32_t real_points = static_cast<uint32_t>(std::min(_nd, _location_to_labels.size()));
+    for (uint32_t point_id = 0; point_id < real_points; ++point_id)
     {
-        const LabelT a = kvA.first;
-        auto cntA_it = _label_occurrence_count.find(a);
-        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
+        const auto &labels = _location_to_labels[point_id];
+        if (labels.empty())
             continue;
-        for (const auto &kvB : kvA.second)
+
+        _data_store->get_vector(point_id, tmp_vec.data());
+
+        for (const auto &la : labels)
         {
-            const LabelT b = kvB.first;
-            auto cntB_it = _label_occurrence_count.find(b);
-            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
+            if (_use_universal_label && la == _universal_label)
                 continue;
-            const double co = static_cast<double>(kvB.second);
-            const double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
-            const float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
-            _label_correlation_matrix[a][b] = s;
-            _label_correlation_matrix[b][a] = s;
+            if ((size_t)la >= _label_centroid_count.size())
+                continue;
+
+            const size_t base = (size_t)la * aligned_dim;
+            for (size_t d = 0; d < aligned_dim; ++d)
+            {
+                _label_centroid_sum[base + d] += static_cast<float>(tmp_vec[d]);
+            }
+            _label_centroid_count[(size_t)la] += 1;
         }
     }
 }
 
-// 计算每个标签的Top-K相关标签列表（降序），存入 _label_top_correlations
+// 计算每个标签的Top-K相似标签列表（按分数降序），存入 _label_top_correlations
+// - L2: score = -||centroid(a) - centroid(b)||^2 （越近越大）
+// - COSINE: score = cos(centroid(a), centroid(b)) （越相似越大）
+// - INNER_PRODUCT: score = centroid(a)·centroid(b) （越相似越大）
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
 {
     _label_top_correlations.clear();
     if (_num_correlated_labels_to_expand == 0 || !_filtered_index)
         return;
 
-    int num = 0;
-
-    // std::cout<<"ok checked3"<<std::endl;
-
-    for (const auto &rowEntry : _label_correlation_matrix)
+    const size_t aligned_dim = _data_store->get_aligned_dim();
+    if (_label_centroid_aligned_dim != aligned_dim || _label_centroid_sum.empty() || _label_centroid_count.empty())
     {
-        const LabelT base = rowEntry.first;
-        const auto &row = rowEntry.second;
-        std::vector<std::pair<float, LabelT>> items;
-        items.reserve(row.size());
-        for (const auto &kv : row)
-        {
-            if (kv.first == base)
-                continue;
-            items.emplace_back(kv.second, kv.first);
-        }
-        std::sort(items.begin(), items.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-        if (items.size() > _num_correlated_labels_to_expand)
-            items.resize(_num_correlated_labels_to_expand);
-        _label_top_correlations[base] = std::move(items);
-
-        num++;
+        // 若未初始化 centroid 统计，先全量计算一次
+        calculate_label_correlations();
     }
-    // std::cout<<"_label_top_correlations.size(): "<<_label_top_correlations.size()<<std::endl;
-    // std::cout<<"num: "<<num<<std::endl;
+    if (_label_centroid_sum.empty() || _label_centroid_count.empty())
+        return;
+
+    for (auto itrA = _labels.begin(); itrA != _labels.end(); ++itrA)
+    {
+        const LabelT a = *itrA;
+        if (_use_universal_label && a == _universal_label)
+            continue;
+        if ((size_t)a >= _label_centroid_count.size() || _label_centroid_count[(size_t)a] == 0)
+            continue;
+
+        std::vector<std::pair<float, LabelT>> items;
+        items.reserve(_labels.size());
+
+        const float invA = 1.0f / static_cast<float>(_label_centroid_count[(size_t)a]);
+        const size_t baseA = (size_t)a * aligned_dim;
+
+        for (auto itrB = _labels.begin(); itrB != _labels.end(); ++itrB)
+        {
+            const LabelT b = *itrB;
+            if (b == a)
+                continue;
+            if (_use_universal_label && b == _universal_label)
+                continue;
+            if ((size_t)b >= _label_centroid_count.size() || _label_centroid_count[(size_t)b] == 0)
+                continue;
+
+            const float invB = 1.0f / static_cast<float>(_label_centroid_count[(size_t)b]);
+            const size_t baseB = (size_t)b * aligned_dim;
+
+            float score = 0.0f;
+            if (_dist_metric == diskann::Metric::L2)
+            {
+                double dist2 = 0.0;
+                for (size_t d = 0; d < aligned_dim; ++d)
+                {
+                    const double ca = static_cast<double>(_label_centroid_sum[baseA + d]) * invA;
+                    const double cb = static_cast<double>(_label_centroid_sum[baseB + d]) * invB;
+                    const double diff = ca - cb;
+                    dist2 += diff * diff;
+                }
+                score = static_cast<float>(-dist2);
+            }
+            else if (_dist_metric == diskann::Metric::COSINE)
+            {
+                double dot = 0.0;
+                double nA = 0.0;
+                double nB = 0.0;
+                for (size_t d = 0; d < aligned_dim; ++d)
+                {
+                    const double ca = static_cast<double>(_label_centroid_sum[baseA + d]) * invA;
+                    const double cb = static_cast<double>(_label_centroid_sum[baseB + d]) * invB;
+                    dot += ca * cb;
+                    nA += ca * ca;
+                    nB += cb * cb;
+                }
+                const double denom = std::sqrt(nA * nB);
+                score = (denom > 0.0) ? static_cast<float>(dot / denom) : -1.0f;
+            }
+            else
+            {
+                // INNER_PRODUCT：使用点积作为相似度分数
+                double dot = 0.0;
+                for (size_t d = 0; d < aligned_dim; ++d)
+                {
+                    const double ca = static_cast<double>(_label_centroid_sum[baseA + d]) * invA;
+                    const double cb = static_cast<double>(_label_centroid_sum[baseB + d]) * invB;
+                    dot += ca * cb;
+                }
+                score = static_cast<float>(dot);
+            }
+
+            items.emplace_back(score, b);
+        }
+
+        std::sort(items.begin(), items.end(), [](const auto &x, const auto &y) { return x.first > y.first; });
+        if (items.size() > _num_correlated_labels_to_expand)
+        {
+            items.resize(_num_correlated_labels_to_expand);
+        }
+        _label_top_correlations[a] = std::move(items);
+    }
 }
 
-// 【新增实现 - 中文说明】基于新插入点的标签，增量更新统计并局部刷新相关性矩阵
 template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
+void Index<T, TagT, LabelT>::update_label_correlations_incremental(const T *point, const std::vector<LabelT> &labels)
 {
     if (!_filtered_index || _num_correlated_labels_to_expand == 0)
         return;
-    // 更新出现次数
-    for (const auto &la : labels)
-        _label_occurrence_count[la] += 1;
-    // 更新共现次数（对称）
-    for (size_t i = 0; i < labels.size(); ++i)
+    if (point == nullptr)
+        return;
+
+    const size_t aligned_dim = _data_store->get_aligned_dim();
+    if (_label_centroid_aligned_dim != aligned_dim || _label_centroid_sum.empty() || _label_centroid_count.empty())
     {
-        for (size_t j = i + 1; j < labels.size(); ++j)
-        {
-            const LabelT a = labels[i];
-            const LabelT b = labels[j];
-            if (a == b)
-                continue;
-            _label_pair_cooccurrence_count[a][b] += 1;
-            _label_pair_cooccurrence_count[b][a] += 1;
-        }
+        // 若尚未初始化 centroid 统计，则先全量计算一次
+        calculate_label_correlations();
     }
-    // 局部刷新相关性矩阵（只重算与本次标签相关的条目）
-    for (const auto &a : labels)
+
+    if (_label_centroid_aligned_dim != aligned_dim)
     {
-        auto cntA_it = _label_occurrence_count.find(a);
-        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
+        // 理论上不会发生；防御式处理
+        _label_centroid_aligned_dim = aligned_dim;
+    }
+
+    // 如遇到新标签，扩容 centroid 存储
+    LabelT max_in_labels = 0;
+    for (const auto &la : labels)
+    {
+        if (_use_universal_label && la == _universal_label)
             continue;
-        for (const auto &b : labels)
+        max_in_labels = std::max(max_in_labels, la);
+    }
+    if ((size_t)max_in_labels >= _label_centroid_count.size())
+    {
+        const size_t new_size = (size_t)max_in_labels + 1;
+        _label_centroid_count.resize(new_size, 0);
+        _label_centroid_sum.resize(new_size * aligned_dim, 0.0f);
+    }
+
+    // 增量累积：sum += point, count += 1
+    for (const auto &la : labels)
+    {
+        if (_use_universal_label && la == _universal_label)
+            continue;
+        if ((size_t)la >= _label_centroid_count.size())
+            continue;
+
+        const size_t base = (size_t)la * aligned_dim;
+        for (size_t d = 0; d < aligned_dim; ++d)
         {
-            if (a == b)
-                continue;
-            auto cntB_it = _label_occurrence_count.find(b);
-            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
-                continue;
-            const double co = static_cast<double>(_label_pair_cooccurrence_count[a][b]);
-            const double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
-            const float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
-            _label_correlation_matrix[a][b] = s;
-            _label_correlation_matrix[b][a] = s;
+            const float v = (d < _dim) ? static_cast<float>(point[d]) : 0.0f;
+            _label_centroid_sum[base + d] += v;
         }
+        _label_centroid_count[(size_t)la] += 1;
     }
 }
 
@@ -3455,10 +3530,10 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
         }
 
         _location_to_labels[location] = labels;
-        // 【新增增量更新 - 中文说明】插入新点后，增量刷新标签相关性统计与矩阵
+        // 【新增增量更新 - 中文说明】插入新点后，增量更新标签 centroid 统计，并刷新 Top-K 相似标签
         if (_num_correlated_labels_to_expand > 0)
         {
-            update_label_correlations_incremental(labels);
+            update_label_correlations_incremental(point, labels);
             compute_top_k_label_correlations();
         }
 
