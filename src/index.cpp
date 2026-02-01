@@ -360,7 +360,7 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
 
     if (!_save_as_one_file)
     {
-        if (_filtered_index)
+        if (_filtered_index || !_location_to_labels.empty() || !_label_to_start_id.empty() || _use_universal_label)
         {
             if (_label_to_start_id.size() > 0)
             {
@@ -1481,8 +1481,8 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
 // 计算标签相关性矩阵（Ochiai）：cnt(ab) 改为“剪枝后图中通过拓扑边连接的次数”
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
 {
-    // 仅在启用过滤索引且标签数据可用时计算
-    if (!_filtered_index)
+    // 仅在标签数据可用时计算
+    if (_location_to_labels.empty())
         return;
     _label_correlation_matrix.clear();
 
@@ -1562,7 +1562,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
 {
     _label_top_correlations.clear();
-    if (_num_correlated_labels_to_expand == 0 || !_filtered_index)
+    if (_num_correlated_labels_to_expand == 0 || _label_correlation_matrix.empty())
         return;
 
     int num = 0;
@@ -1598,7 +1598,7 @@ void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::ve
 {
     // 【修改说明】cnt(ab) 基于“剪枝后图边”，很难在增量插入时做局部更新；
     // 这里直接全量重算，保证语义正确（性能如需优化可后续再做）。
-    if (!_filtered_index || _num_correlated_labels_to_expand == 0)
+    if (_num_correlated_labels_to_expand == 0 || _location_to_labels.empty())
         return;
     (void)labels;
     calculate_label_correlations();
@@ -2195,6 +2195,33 @@ void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t nu
     {
         this->build(data_file.c_str(), points_to_load);
     }
+    else if (filter_params.post_build_label_processing)
+    {
+        // 【新增 - 中文说明】先建普通图，再加载标签并计算相关性
+        std::string labels_file_to_use = filter_params.save_path_prefix + "_label_formatted.txt";
+        std::string mem_labels_int_map_file = filter_params.save_path_prefix + "_labels_map.txt";
+        convert_labels_string_to_int(filter_params.label_file, labels_file_to_use, mem_labels_int_map_file,
+                                     filter_params.universal_label);
+        _label_map = load_label_map(mem_labels_int_map_file);
+        if (filter_params.universal_label != "")
+        {
+            LabelT unv_label_as_num = 0;
+            this->set_universal_label(unv_label_as_num);
+        }
+
+        this->build(data_file.c_str(), points_to_load);
+
+        size_t num_points_labels = 0;
+        parse_label_file(labels_file_to_use, num_points_labels);
+        assert(num_points_labels == points_to_load);
+        prepare_label_metadata(points_to_load);
+
+        if (_num_correlated_labels_to_expand > 0)
+        {
+            calculate_label_correlations();
+            compute_top_k_label_correlations();
+        }
+    }
     else
     {
         // TODO: this should ideally happen in save()
@@ -2202,6 +2229,7 @@ void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t nu
         std::string mem_labels_int_map_file = filter_params.save_path_prefix + "_labels_map.txt";
         convert_labels_string_to_int(filter_params.label_file, labels_file_to_use, mem_labels_int_map_file,
                                      filter_params.universal_label);
+        _label_map = load_label_map(mem_labels_int_map_file);
         if (filter_params.universal_label != "")
         {
             LabelT unv_label_as_num = 0;
@@ -2299,32 +2327,12 @@ void Index<T, TagT, LabelT>::parse_label_file(const std::string &label_file, siz
 }
 
 template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::_set_universal_label(const LabelType universal_label)
+void Index<T, TagT, LabelT>::prepare_label_metadata(const size_t num_points_to_load)
 {
-    this->set_universal_label(std::any_cast<const LabelT>(universal_label));
-}
-
-template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::set_universal_label(const LabelT &label)
-{
-    _use_universal_label = true;
-    _universal_label = label;
-}
-
-template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const std::string &label_file,
-                                                  const size_t num_points_to_load, const std::vector<TagT> &tags)
-{
-    _filtered_index = true;
     _label_to_start_id.clear();
-    size_t num_points_labels = 0;
-
-    parse_label_file(label_file,
-                     num_points_labels); // determines medoid for each label and identifies
-                                         // the points to label mapping
+    _medoid_counts.clear();
 
     std::unordered_map<LabelT, std::vector<uint32_t>> label_to_points;
-
     for (uint32_t point_id = 0; point_id < num_points_to_load; point_id++)
     {
         for (auto label : _location_to_labels[point_id])
@@ -2404,8 +2412,12 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
     {
         uint32_t best_medoid_count = std::numeric_limits<uint32_t>::max();
         auto &curr_label = *itr;
-        uint32_t best_medoid;
+        uint32_t best_medoid = 0;
         auto labeled_points = label_to_points[curr_label];
+        if (labeled_points.empty())
+        {
+            continue;
+        }
         for (uint32_t cnd = 0; cnd < num_cands; cnd++)
         {
             uint32_t cur_cnd = labeled_points[rand() % labeled_points.size()];
@@ -2428,6 +2440,33 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
         _label_to_start_id[curr_label] = best_medoid;
         _medoid_counts[best_medoid]++;
     }
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::_set_universal_label(const LabelType universal_label)
+{
+    this->set_universal_label(std::any_cast<const LabelT>(universal_label));
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::set_universal_label(const LabelT &label)
+{
+    _use_universal_label = true;
+    _universal_label = label;
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const std::string &label_file,
+                                                  const size_t num_points_to_load, const std::vector<TagT> &tags)
+{
+    _filtered_index = true;
+    size_t num_points_labels = 0;
+
+    parse_label_file(label_file,
+                     num_points_labels); // determines medoid for each label and identifies
+                                         // the points to label mapping
+
+    prepare_label_metadata(num_points_to_load);
 
     std::cout << "ok checked" << std::endl;
 

@@ -13,12 +13,14 @@ struct IndexFilterParams
     std::string tags_file;
     std::string universal_label;
     uint32_t filter_threshold = 0;
+    bool post_build_label_processing = false;
 
   private:
     IndexFilterParams(const std::string &save_path_prefix, const std::string &label_file,
-                      const std::string &universal_label, uint32_t filter_threshold)
+                      const std::string &universal_label, uint32_t filter_threshold,
+                      bool post_build_label_processing)
         : save_path_prefix(save_path_prefix), label_file(label_file), universal_label(universal_label),
-          filter_threshold(filter_threshold)
+          filter_threshold(filter_threshold), post_build_label_processing(post_build_label_processing)
     {
     }
 
@@ -55,9 +57,17 @@ class IndexFilterParamsBuilder
         return *this;
     }
 
+    // 【新增 - 中文说明】只在建图后处理标签与相关性，不走过滤建图
+    IndexFilterParamsBuilder &with_post_build_label_processing(const bool post_build_label_processing)
+    {
+        this->_post_build_label_processing = post_build_label_processing;
+        return *this;
+    }
+
     IndexFilterParams build()
     {
-        return IndexFilterParams(_save_path_prefix, _label_file, _universal_label, _filter_threshold);
+        return IndexFilterParams(_save_path_prefix, _label_file, _universal_label, _filter_threshold,
+                                 _post_build_label_processing);
     }
 
     IndexFilterParamsBuilder(const IndexFilterParamsBuilder &) = delete;
@@ -69,5 +79,6 @@ class IndexFilterParamsBuilder
     std::string _tags_file;
     std::string _universal_label;
     uint32_t _filter_threshold = 0;
+    bool _post_build_label_processing = false;
 };
 } // namespace diskann

@@ -115,7 +115,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     void set_expand_labels_k(uint32_t k) override
     {
         _num_correlated_labels_to_expand = k;
-        if (_num_correlated_labels_to_expand > 0 && _filtered_index)
+        if (_num_correlated_labels_to_expand > 0 && !_location_to_labels.empty())
         {
             // 运行时启用扩展时，确保已根据当前已加载的标签数据计算相关性与Top-K
             calculate_label_correlations();
@@ -306,6 +306,9 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t calculate_entry_point();
 
     void parse_label_file(const std::string &label_file, size_t &num_pts_labels);
+
+    // 【新增声明 - 中文说明】基于已加载的标签，准备频率统计与标签起点
+    void prepare_label_metadata(const size_t num_points_to_load);
 
     // 计算每个标签的Top-K相关标签（按相关性分数降序）
     void compute_top_k_label_correlations();

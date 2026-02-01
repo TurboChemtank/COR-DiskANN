@@ -28,6 +28,7 @@ int main(int argc, char **argv)
     uint32_t num_threads, R, L, Lf, build_PQ_bytes;
     float alpha;
     bool use_pq_build, use_opq;
+    bool post_build_label_processing = false;
     // 【新增参数】查询时扩展的相关标签个数K（默认0不扩展）
     uint32_t expand_labels_k = 0;
 
@@ -76,6 +77,10 @@ int main(int argc, char **argv)
         // 【新增可选参数】查询时扩展Top-K相关标签
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
+        // 【新增可选参数】仅在建图后处理标签与相关性（不走过滤建图）
+        optional_configs.add_options()("post_build_label_processing",
+                                       po::bool_switch(&post_build_label_processing)->default_value(false),
+                                       "Post-process labels after building a vanilla graph (default false)");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -138,6 +143,7 @@ int main(int argc, char **argv)
                                  .with_universal_label(universal_label)
                                  .with_label_file(label_file)
                                  .with_save_path_prefix(index_path_prefix)
+                                 .with_post_build_label_processing(post_build_label_processing)
                                  .build();
         auto config = diskann::IndexConfigBuilder()
                           .with_metric(metric)
