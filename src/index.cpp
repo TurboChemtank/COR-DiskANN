@@ -1478,7 +1478,7 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
 }
 
 // 【修改实现 - 中文说明】
-// 计算标签相关性矩阵（Ochiai）：cnt(ab) 改为“剪枝后图中通过拓扑边连接的次数”
+// 计算标签相关性矩阵：基于标签 centroid 距离，距离越近相关度越高
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
 {
     // 仅在标签数据可用时计算
@@ -1486,74 +1486,99 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
         return;
     _label_correlation_matrix.clear();
 
-    // 1) cnt(a)：仍按“标签在数据点上出现次数”统计（不包含 frozen points）
+    // 1) 计算每个标签的中心向量（centroid）与出现次数
+    std::unordered_map<LabelT, std::vector<float>> label_sums;
     std::unordered_map<LabelT, uint64_t> label_counts;
     const uint32_t real_points = static_cast<uint32_t>(_max_points);
+    const size_t aligned_dim = _data_store->get_aligned_dim();
+    std::vector<T> point_buf(aligned_dim);
+
+    auto add_point_to_label = [&](const LabelT label, const T *vec) {
+        auto it = label_sums.find(label);
+        if (it == label_sums.end())
+        {
+            it = label_sums.emplace(label, std::vector<float>(_dim, 0.0f)).first;
+        }
+        auto &sum = it->second;
+        for (size_t d = 0; d < _dim; d++)
+        {
+            sum[d] += static_cast<float>(vec[d]);
+        }
+        label_counts[label] += 1;
+    };
+
     for (uint32_t point_id = 0; point_id < real_points && point_id < _location_to_labels.size(); ++point_id)
     {
         const auto &labels = _location_to_labels[point_id];
+        if (labels.empty())
+            continue;
+
+        _data_store->get_vector((location_t)point_id, point_buf.data());
+
         for (const auto &la : labels)
         {
-            label_counts[la] += 1;
-        }
-    }
-
-    // 2) cnt(ab)：剪枝后图中“拓扑边”连接次数（对称累计）
-    // - 对每条有向边 u->v，遍历 labels(u) × labels(v)，对 (a,b) 累加 1（并对称写入 b->a）
-    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> edge_counts;
-    for (uint32_t u = 0; u < real_points; ++u)
-    {
-        if (u >= _location_to_labels.size())
-            break;
-        const auto &lu = _location_to_labels[u];
-        if (lu.empty())
-            continue;
-        const auto &nghrs = _graph_store->get_neighbours((location_t)u);
-        for (const auto &v_loc : nghrs)
-        {
-            const uint32_t v = (uint32_t)v_loc;
-            if (v >= real_points || v == u)
-                continue;
-            if (v >= _location_to_labels.size())
-                continue;
-            const auto &lv = _location_to_labels[v];
-            if (lv.empty())
-                continue;
-            for (const auto &a : lu)
+            if (_use_universal_label && la == _universal_label)
             {
-                for (const auto &b : lv)
+                for (auto itr = _labels.begin(); itr != _labels.end(); ++itr)
                 {
-                    if (a == b)
+                    const LabelT x = *itr;
+                    if (x == _universal_label)
                         continue;
-                    edge_counts[a][b] += 1;
-                    edge_counts[b][a] += 1;
+                    add_point_to_label(x, point_buf.data());
                 }
+            }
+            else
+            {
+                add_point_to_label(la, point_buf.data());
             }
         }
     }
 
-    // 将统计缓存至成员，供后续增量更新/持久化使用
-    _label_occurrence_count = std::move(label_counts);
-    _label_pair_edge_count = std::move(edge_counts);
-
-    // 3) 计算 Ochiai：cnt(ab) / sqrt(cnt(a) * cnt(b))
-    for (const auto &kvA : _label_pair_edge_count)
+    _label_centroids.clear();
+    _label_centroids.reserve(label_sums.size());
+    for (auto &kv : label_sums)
     {
-        const LabelT a = kvA.first;
-        auto cntA_it = _label_occurrence_count.find(a);
-        if (cntA_it == _label_occurrence_count.end() || cntA_it->second == 0)
+        const LabelT label = kv.first;
+        auto &sum = kv.second;
+        const uint64_t cnt = label_counts[label];
+        if (cnt == 0)
             continue;
-        for (const auto &kvB : kvA.second)
+        for (size_t d = 0; d < _dim; d++)
         {
-            const LabelT b = kvB.first;
-            auto cntB_it = _label_occurrence_count.find(b);
-            if (cntB_it == _label_occurrence_count.end() || cntB_it->second == 0)
-                continue;
-            const double co = static_cast<double>(kvB.second);
-            const double score = co / std::sqrt(static_cast<double>(cntA_it->second) * static_cast<double>(cntB_it->second));
-            const float s = static_cast<float>(std::max(0.0, std::min(1.0, score)));
-            _label_correlation_matrix[a][b] = s;
-            _label_correlation_matrix[b][a] = s;
+            sum[d] /= static_cast<float>(cnt);
+        }
+        _label_centroids[label] = std::move(sum);
+    }
+
+    _label_occurrence_count = label_counts;
+    _label_pair_edge_count.clear();
+
+    // 2) 基于 centroid 距离计算相关度：距离越近，相关度越高
+    std::vector<LabelT> label_list;
+    label_list.reserve(_label_centroids.size());
+    for (const auto &kv : _label_centroids)
+    {
+        label_list.emplace_back(kv.first);
+    }
+
+    for (size_t i = 0; i < label_list.size(); i++)
+    {
+        const LabelT a = label_list[i];
+        const auto &ca = _label_centroids[a];
+        for (size_t j = i + 1; j < label_list.size(); j++)
+        {
+            const LabelT b = label_list[j];
+            const auto &cb = _label_centroids[b];
+            float dist = 0.0f;
+            for (size_t d = 0; d < _dim; d++)
+            {
+                const float diff = ca[d] - cb[d];
+                dist += diff * diff;
+            }
+            dist = std::sqrt(dist);
+            const float score = 1.0f / (1.0f + dist);
+            _label_correlation_matrix[a][b] = score;
+            _label_correlation_matrix[b][a] = score;
         }
     }
 }
@@ -1596,8 +1621,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
 {
-    // 【修改说明】cnt(ab) 基于“剪枝后图边”，很难在增量插入时做局部更新；
-    // 这里直接全量重算，保证语义正确（性能如需优化可后续再做）。
+    // 【修改说明】相关度基于 centroid，增量插入也直接全量重算，保证语义正确
     if (_num_correlated_labels_to_expand == 0 || _location_to_labels.empty())
         return;
     (void)labels;

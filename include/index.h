@@ -466,6 +466,9 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 每个标签的Top-K相关标签列表
     std::unordered_map<LabelT, std::vector<std::pair<float, LabelT>>> _label_top_correlations;
 
+    // 【新增成员 - 中文说明】每个标签的中心向量（用于基于中心距离的相关度）
+    std::unordered_map<LabelT, std::vector<float>> _label_centroids;
+
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
     // cnt(labelA,labelB)：剪枝后图中“拓扑边”产生的连接次数（对称累计）
