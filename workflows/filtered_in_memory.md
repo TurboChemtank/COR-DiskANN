@@ -93,6 +93,22 @@ Label count for each unique label in the generated label file can be printed wit
 	
 Note that neither approach is designed for use with random synthetic labels, which will lead to unpredictable accuracy at search time.
 
+An alternative utility is available if you want synthetic labels with both:
+1) Zipf-style global frequencies and 2) soft spatial locality around randomly chosen anchors:
+```bash
+python3 python/apps/generate-clustered-zipf-labels.py \
+  --data siftsmall/siftsmall_base.bin \
+  --out ./clustered_labels_50_10K.txt \
+  --num_labels 50 \
+  --zipf 1.5 \
+  --avg_labels 5 \
+  --penalty 2.0 \
+  --scatter 0.8 \
+  --seed 42
+```
+By default this script fills empty-label points with one sampled label to keep the output compatible with DiskANN
+filtered index build.
+
 Now build and search the index and measure the recall using ground truth computed using bruteforce. We search for results with the filter 35.
 ```bash
 build/apps/utils/compute_groundtruth --data_type float --dist_fn l2 --base_file siftsmall/siftsmall_base.bin --query_file siftsmall/siftsmall_query.bin --gt_file siftsmall/siftsmall_gt_35.bin --K 100 --label_file ./rand_labels_50_10K.txt --filter_label 35 --universal_label 0
