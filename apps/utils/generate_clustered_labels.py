@@ -59,7 +59,7 @@ def process_single_label(task_info):
     label_id, count, gamma, penalty_weight = task_info
 
     if count <= 0:
-        return (label_id, [])
+        return (str(label_id), [])
 
     # 安全保护：无放回采样时 count 不能超过点数
     count = min(int(count), int(global_npts))
@@ -100,7 +100,8 @@ def process_single_label(task_info):
     for idx in chosen_indices:
         global_labels_per_point[idx] += 1.0
 
-    return (f"L_{label_id}", chosen_indices.tolist())
+    # 输出标签改为 1..N，预留 0 作为 universal 可选值
+    return (str(label_id), chosen_indices.tolist())
 
 
 def estimate_mean_sq_dist(fbin_path, npts, dim, sample_size=100_000):
@@ -154,7 +155,8 @@ def main():
     tasks = []
     label_order = np.random.permutation(args.num_labels)
     for l in label_order:
-        tasks.append((l, int(target_counts[l]), args.gamma, args.penalty))
+        # 任务标签ID使用 1..N（而非 0..N-1）
+        tasks.append((int(l) + 1, int(target_counts[l]), args.gamma, args.penalty))
 
     # 5. 分配底层 C 语言共享内存 (400MB 左右)
     print("Allocating lock-free shared memory for capacity penalty...")
@@ -185,8 +187,8 @@ def main():
     orphan_count = 0
     for idx in range(npts):
         if len(point_labels[idx]) == 0:
-            random_label_idx = np.random.choice(args.num_labels, p=probabilities)
-            point_labels[idx].append(f"L_{random_label_idx}")
+            random_label_idx = int(np.random.choice(args.num_labels, p=probabilities)) + 1
+            point_labels[idx].append(str(random_label_idx))
             orphan_count += 1
     print(f"Fixed {orphan_count} orphan points.")
 
