@@ -24,6 +24,7 @@
 
 #include "quantized_distance.h"
 #include "pq_data_store.h"
+#include <atomic>
 
 #define OVERHEAD_FACTOR 1.1
 #define EXPAND_IF_FULL 0
@@ -126,6 +127,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // Get converted integer label from string to int map (_label_map)
     DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label) const;
 
+    DISKANN_DLLEXPORT bool matches_any_labels(const TagT &tag, const std::vector<std::string> &raw_labels);
+
     // 【新增接口 - 中文说明】供上层按频率门槛决定是否扩展搜索
     uint32_t get_filter_frequency_threshold() const override
     {
@@ -193,7 +196,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // Initialize space for res_vectors before calling.
     DISKANN_DLLEXPORT size_t search_with_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
                                               float *distances, std::vector<T *> &res_vectors, bool use_filters = false,
-                                              const std::string filter_label = "");
+                                              const std::string filter_label = "", const int expand_num = -1);
 
     // Filter support search
     template <typename IndexType>
@@ -280,13 +283,15 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     virtual void _set_start_points_at_random(DataType radius, uint32_t random_seed = 0) override;
 
+    virtual bool _matches_any_labels(const TagType &tag, const std::vector<std::string> &raw_labels) override;
+
     virtual int _get_vector_by_tag(TagType &tag, DataType &vec) override;
 
     virtual void _search_with_optimized_layout(const DataType &query, size_t K, size_t L, uint32_t *indices) override;
 
     virtual size_t _search_with_tags(const DataType &query, const uint64_t K, const uint32_t L, const TagType &tags,
                                      float *distances, DataVector &res_vectors, bool use_filters = false,
-                                     const std::string filter_label = "") override;
+                                     const std::string filter_label = "", const int expand_num = -1) override;
 
     virtual void _set_universal_label(const LabelType universal_label) override;
 
@@ -343,9 +348,42 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增声明 - 中文说明】计算标签相关性的内部方法，在构建过滤索引前调用
     void calculate_label_correlations();
+    void initialize_label_projection();
+    bool use_projected_label_centroids() const;
+    void rebuild_projected_label_centroids();
+    void update_projected_label_centroid(const LabelT &label);
+    float compute_label_correlation_distance(const std::vector<float> &lhs, const std::vector<float> &rhs) const;
 
     // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
     void update_label_correlations_incremental(const std::vector<LabelT> &labels);
+
+    struct PendingLabelEvent
+    {
+        bool is_insert = true;
+        TagT tag{};
+        uint32_t location = 0;
+        uint64_t seq = 0;
+    };
+
+    // 判断是否达到标签元数据懒更新阈值（基于插入+删除累计次数）
+    bool need_flush_pending_label_updates() const;
+    // 应用累积的标签元数据增量（频率、门槛、centroid、medoid、相关性、Top-K）
+    void flush_pending_label_updates(const bool force = false);
+    // 记录插入事件及对应标签增量
+    void record_insert_label_updates(uint32_t location, const TagT tag, const T *point,
+                                     const std::vector<LabelT> &labels);
+    // 记录删除事件及对应标签增量
+    void record_delete_label_updates(uint32_t location, const TagT tag);
+    // 批量更新时，仅刷新脏标签的medoid
+    void refresh_dirty_label_medoids();
+    // 批量更新时，仅刷新脏标签相关性（行列）
+    void refresh_dirty_label_correlations();
+
+    template <typename IdType>
+    std::pair<uint32_t, uint32_t> brute_force_search_pending_label(const T *query, const LabelT &filter_label,
+                                                                   const size_t K, IdType *indices, float *distances,
+                                                                   const bool return_tags = false,
+                                                                   std::vector<T *> *res_vectors = nullptr);
 
     // add reverse links from all the visited nodes to node n.
     void inter_insert(uint32_t n, std::vector<uint32_t> &pruned_list, const uint32_t range,
@@ -468,6 +506,9 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增成员 - 中文说明】每个标签的中心向量（用于基于中心距离的相关度）
     std::unordered_map<LabelT, std::vector<float>> _label_centroids;
+    std::unordered_map<LabelT, std::vector<float>> _projected_label_centroids;
+    std::vector<float> _label_projection_matrix;
+    uint32_t _label_projection_dim{32};
 
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
@@ -487,6 +528,23 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 【新增成员 - 中文说明】标签频率数组与Otsu门槛值（门槛值是“频率值”，用于比较 freq<=threshold）
     std::vector<uint32_t> _label_frequency;
     uint32_t _label_frequency_otsu_threshold = 0;
+
+    // 标签元数据懒更新：累计插入+删除次数
+    std::atomic<uint64_t> _pending_label_update_ops{0};
+    float _filter_lazy_update_ratio{0.01f};
+    uint32_t _filter_lazy_update_min_ops{128};
+    uint64_t _pending_event_seq{0};
+    tsl::robin_set<LabelT> _dirty_labels;
+    std::unordered_map<LabelT, int64_t> _pending_label_frequency_delta;
+    std::unordered_map<LabelT, std::vector<float>> _pending_label_centroid_sum_delta;
+    std::unordered_map<LabelT, int64_t> _pending_label_centroid_count_delta;
+
+    // 新标签在批量刷新前使用临时事件序列进行暴力扫描查询
+    tsl::robin_set<LabelT> _pending_new_labels;
+    std::unordered_map<LabelT, std::vector<PendingLabelEvent>> _pending_new_label_events;
+
+    // label -> 活跃tag集合（用于局部重选medoid）
+    std::unordered_map<LabelT, tsl::robin_set<TagT>> _label_to_active_tags;
 
     // Query scratch data structures
     ConcurrentQueue<InMemQueryScratch<T> *> _query_scratch;

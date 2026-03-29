@@ -4,8 +4,11 @@
 #include <cstring>
 #include <iomanip>
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <numeric>
 #include <omp.h>
+#include <queue>
 #include <set>
 #include <string.h>
 #include <boost/program_options.hpp>
@@ -21,6 +24,7 @@
 #endif
 
 #include "index.h"
+#include "distance.h"
 #include "memory_mapper.h"
 #include "utils.h"
 #include "program_options_utils.hpp"
@@ -94,13 +98,118 @@ std::vector<std::vector<std::string>> parse_query_filters_file(const std::string
     return query_filters;
 }
 
+struct SearchRunStats
+{
+    double displayed_qps = 0.0;
+    float avg_cmps = 0.0f;
+    float mean_latency = 0.0f;
+    float p999_latency = 0.0f;
+    bool valid = false;
+};
+
+inline void save_groundtruth_as_one_file(const std::string &filename, uint32_t *data, float *distances, size_t npts,
+                                         size_t ndims)
+{
+    std::ofstream writer(filename, std::ios::binary | std::ios::out);
+    int npts_i32 = (int)npts, ndims_i32 = (int)ndims;
+    writer.write((char *)&npts_i32, sizeof(int));
+    writer.write((char *)&ndims_i32, sizeof(int));
+    std::cout << "Saving truthset in one file (npts, dim, npts*dim id-matrix, npts*dim dist-matrix) with npts = "
+              << npts << ", dim = " << ndims << std::endl;
+    writer.write((char *)data, npts * ndims * sizeof(uint32_t));
+    writer.write((char *)distances, npts * ndims * sizeof(float));
+    writer.close();
+    std::cout << "Finished writing truthset to " << filename << std::endl;
+}
+
+template <typename T>
+void build_dynamic_groundtruth(diskann::AbstractIndex &index, diskann::Metric metric, const T *query, size_t query_num,
+                               size_t query_dim, size_t query_aligned_dim,
+                               const std::vector<std::vector<std::string>> &query_label_sets, uint32_t recall_at,
+                               uint32_t num_threads, std::vector<uint32_t> &gt_ids,
+                               std::vector<float> &gt_dists)
+{
+    using TagT = uint32_t;
+    tsl::robin_set<TagT> active_tag_set;
+    index.get_active_tags(active_tag_set);
+    std::vector<TagT> active_tags(active_tag_set.begin(), active_tag_set.end());
+    std::sort(active_tags.begin(), active_tags.end());
+
+    std::cout << "Building dynamic ground truth from current active index..." << std::endl;
+    std::cout << "Active tags: " << active_tags.size() << std::endl;
+
+    std::vector<T> active_vectors(active_tags.size() * query_dim);
+    for (size_t i = 0; i < active_tags.size(); i++)
+    {
+        TagT tag = active_tags[i];
+        if (index.get_vector_by_tag(tag, active_vectors.data() + i * query_dim) != 0)
+        {
+            throw diskann::ANNException("Failed to fetch vector by tag while building dynamic ground truth", -1);
+        }
+    }
+
+    std::unique_ptr<diskann::Distance<T>> distance_fn(diskann::get_distance_function<T>(metric));
+    gt_ids.assign(query_num * recall_at, 0U);
+    gt_dists.assign(query_num * recall_at, std::numeric_limits<float>::infinity());
+
+    omp_set_num_threads(num_threads);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t query_idx = 0; query_idx < (int64_t)query_num; query_idx++)
+    {
+        using Candidate = std::pair<float, uint32_t>;
+        std::priority_queue<Candidate> topk;
+        const T *query_vec = query + query_idx * query_aligned_dim;
+        const auto &query_labels = query_label_sets[(size_t)query_idx];
+
+        for (size_t active_idx = 0; active_idx < active_tags.size(); active_idx++)
+        {
+            const TagT tag = active_tags[active_idx];
+            if (!index.matches_any_labels(tag, query_labels))
+            {
+                continue;
+            }
+
+            const float dist = distance_fn->compare(query_vec, active_vectors.data() + active_idx * query_dim,
+                                                    (uint32_t)query_dim);
+            if (topk.size() < recall_at)
+            {
+                topk.emplace(dist, static_cast<uint32_t>(tag));
+            }
+            else if (dist < topk.top().first)
+            {
+                topk.pop();
+                topk.emplace(dist, static_cast<uint32_t>(tag));
+            }
+        }
+
+        std::vector<Candidate> ordered;
+        ordered.reserve(topk.size());
+        while (!topk.empty())
+        {
+            ordered.push_back(topk.top());
+            topk.pop();
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const Candidate &lhs, const Candidate &rhs) { return lhs.first < rhs.first; });
+
+        for (size_t i = 0; i < ordered.size(); i++)
+        {
+            gt_ids[(size_t)query_idx * recall_at + i] = ordered[i].second;
+            gt_dists[(size_t)query_idx * recall_at + i] = ordered[i].first;
+        }
+    }
+
+    std::cout << "Dynamic ground truth built." << std::endl;
+}
+
 template <typename T, typename LabelT = uint32_t>
 int search_memory_index(diskann::Metric &metric, const std::string &index_path, const std::string &result_path_prefix,
                         const std::string &query_file, const std::string &truthset_file, const uint32_t num_threads,
                         const uint32_t recall_at, const bool print_all_recalls, const std::vector<uint32_t> &Lvec,
                         const bool dynamic, const bool tags, const bool show_qps_per_thread,
                         const std::string &query_filters_file, // 修改：接收文件路径
-                        const float fail_if_recall_below, const uint32_t expand_labels_k)
+                        const float fail_if_recall_below, const uint32_t expand_labels_k,
+                        const uint32_t label_projection_dim)
 {
     using TagT = uint32_t;
     using IdType = uint32_t; // 内存索引通常使用 uint32_t 作为ID
@@ -111,6 +220,10 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     uint32_t *gt_ids = nullptr;
     float *gt_dists = nullptr;
     size_t query_num, query_dim, query_aligned_dim, gt_num, gt_dim;
+    std::vector<uint32_t> dynamic_gt_ids;
+    std::vector<float> dynamic_gt_dists;
+    bool need_dynamic_groundtruth = false;
+    std::string dynamic_gt_output_file;
     diskann::load_aligned_bin<T>(query_file, query, query_num, query_dim, query_aligned_dim);
 
     // 加载真值文件
@@ -125,6 +238,26 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
         }
         calc_recall_flag = true;
         diskann::cout << "Ground truth file loaded. Recall will be calculated." << std::endl;
+    }
+    else if (dynamic && tags)
+    {
+        calc_recall_flag = true;
+        gt_num = query_num;
+        gt_dim = recall_at;
+        need_dynamic_groundtruth = true;
+        dynamic_gt_output_file = result_path_prefix + "_dynamic_gt.bin";
+        if (truthset_file != std::string("null"))
+        {
+            diskann::cout << "Truthset file " << truthset_file
+                          << " not found. Will build brute-force ground truth from current active dynamic index."
+                          << std::endl;
+        }
+        else
+        {
+            diskann::cout << "Dynamic+tags mode without gt_file: will build brute-force ground truth from current "
+                             "active index."
+                          << std::endl;
+        }
     }
     else
     {
@@ -141,6 +274,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             .with_num_threads(num_threads)
             .with_filter_list_size(diskann::defaults::FILTER_LIST_SIZE)
             .with_num_correlated_labels_to_expand(expand_labels_k)
+            .with_label_projection_dim(label_projection_dim)
             .build();
 
     auto config = diskann::IndexConfigBuilder()
@@ -158,7 +292,8 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                       .is_concurrent_consolidate(false)
                       .is_pq_dist_build(false)
                       .is_use_opq(false)
-                      .is_filtered(true)
+                      // 中文说明：COR 动态索引当前保存的是纯 ANNS 图，加载时必须保持相同语义。
+                      .is_filtered(false)
                       .with_num_pq_chunks(0)
                       .with_num_frozen_pts(num_frozen_pts)
                       .build();
@@ -215,6 +350,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     std::vector<std::vector<float>> query_result_dists(Lvec.size());
     std::vector<float> latency_stats(query_num, 0);
     std::vector<uint32_t> cmp_stats(query_num, 0);
+    std::vector<SearchRunStats> run_stats(Lvec.size());
 
     double best_recall = 0.0;
 
@@ -244,7 +380,10 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             diskann::cout << "Ignoring search with L:" << L << " since it's smaller than K:" << recall_at << std::endl;
             continue;
         }
-
+        
+        
+        std::cout<<"check:\n"<<std::endl;
+        
         query_result_ids[test_id].resize(recall_at * query_num);
         query_result_dists[test_id].resize(recall_at * query_num);
 
@@ -267,7 +406,9 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
 
             // 2. 创建线程本地的临时缓冲区
             std::vector<IdType> temp_ids(recall_at);
+            std::vector<TagT> temp_tags(recall_at);
             std::vector<float> temp_dists(recall_at);
+            std::vector<T *> temp_res_vectors;
 
             // 3. 执行“OR”查询（新内循环）
             for (const auto &single_label_str : current_query_labels)
@@ -288,11 +429,18 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                 // 同时用 try/catch 防御 OpenMP 线程内异常导致的进程终止。
                 try
                 {
-                    std::any any_query = static_cast<const T *>(query_vec);
-                    auto retval =
-                        index->search_with_filters(any_query, single_label_str, recall_at, L, use_expand, temp_ids.data(),
-                                                   temp_dists.data());
-                    current_cmp_stats += retval.second; // 累加比较次数
+                    if (dynamic && tags)
+                    {
+                        index->search_with_tags(query_vec, recall_at, L, temp_tags.data(), temp_dists.data(),
+                                                temp_res_vectors, true, single_label_str, (int)use_expand);
+                    }
+                    else
+                    {
+                        std::any any_query = static_cast<const T *>(query_vec);
+                        auto retval = index->search_with_filters(any_query, single_label_str, recall_at, L, use_expand,
+                                                                 temp_ids.data(), temp_dists.data());
+                        current_cmp_stats += retval.second; // 累加比较次数
+                    }
                 }
                 catch (const std::bad_any_cast &)
                 {
@@ -313,7 +461,9 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                         // 使用 MIPS 调整后的距离（如果适用）进行排序
                         float dist_for_comp =
                             (metric == diskann::Metric::INNER_PRODUCT) ? -temp_dists[j] : temp_dists[j];
-                        aggregated_results.insert(diskann::Neighbor(temp_ids[j], dist_for_comp));
+                        const uint32_t result_id =
+                            (dynamic && tags) ? static_cast<uint32_t>(temp_tags[j]) : static_cast<uint32_t>(temp_ids[j]);
+                        aggregated_results.insert(diskann::Neighbor(result_id, dist_for_comp));
                     }
                 }
             }
@@ -348,10 +498,39 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
         }
         std::chrono::duration<double> diff = std::chrono::high_resolution_clock::now() - s;
 
-        // --- 性能计算和输出 (基本不变) ---
+        // --- 性能统计暂存，待真值准备好后统一输出 ---
         double displayed_qps = query_num / diff.count();
         if (show_qps_per_thread)
             displayed_qps /= num_threads;
+
+        std::sort(latency_stats.begin(), latency_stats.end());
+        double mean_latency =
+            std::accumulate(latency_stats.begin(), latency_stats.end(), 0.0) / static_cast<float>(query_num);
+
+        float avg_cmps = (float)std::accumulate(cmp_stats.begin(), cmp_stats.end(), 0) / (float)query_num;
+        run_stats[test_id].displayed_qps = displayed_qps;
+        run_stats[test_id].avg_cmps = avg_cmps;
+        run_stats[test_id].mean_latency = (float)mean_latency;
+        run_stats[test_id].p999_latency = (float)latency_stats[(uint64_t)(0.999 * query_num)];
+        run_stats[test_id].valid = true;
+    }
+
+    if (need_dynamic_groundtruth)
+    {
+        build_dynamic_groundtruth<T>(*index, metric, query, query_num, query_dim, query_aligned_dim, query_label_sets,
+                                     recall_at, num_threads, dynamic_gt_ids, dynamic_gt_dists);
+        gt_ids = dynamic_gt_ids.data();
+        gt_dists = dynamic_gt_dists.data();
+        save_groundtruth_as_one_file(dynamic_gt_output_file, gt_ids, gt_dists, query_num, recall_at);
+    }
+
+    for (uint32_t test_id = 0; test_id < Lvec.size(); test_id++)
+    {
+        uint32_t L = Lvec[test_id];
+        if (L < recall_at || !run_stats[test_id].valid)
+        {
+            continue;
+        }
 
         std::vector<double> recalls;
         if (calc_recall_flag)
@@ -364,15 +543,9 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             }
         }
 
-        std::sort(latency_stats.begin(), latency_stats.end());
-        double mean_latency =
-            std::accumulate(latency_stats.begin(), latency_stats.end(), 0.0) / static_cast<float>(query_num);
-
-        float avg_cmps = (float)std::accumulate(cmp_stats.begin(), cmp_stats.end(), 0) / (float)query_num;
-
-        std::cout << std::setw(4) << L << std::setw(12) << displayed_qps << std::setw(18) << avg_cmps << std::setw(20)
-                  << (float)mean_latency << std::setw(15) << (float)latency_stats[(uint64_t)(0.999 * query_num)];
-
+        std::cout << std::setw(4) << L << std::setw(12) << run_stats[test_id].displayed_qps << std::setw(18)
+                  << run_stats[test_id].avg_cmps << std::setw(20) << run_stats[test_id].mean_latency << std::setw(15)
+                  << run_stats[test_id].p999_latency;
         for (double recall : recalls)
         {
             std::cout << std::setw(12) << recall;
@@ -416,6 +589,7 @@ int main(int argc, char **argv)
     bool print_all_recalls, dynamic, tags, show_qps_per_thread;
     float fail_if_recall_below = 0.0f;
     uint32_t expand_labels_k = 0;
+    uint32_t label_projection_dim = 32;
 
     po::options_description desc{program_options_utils::make_program_description(
         "multi_filters_search_memory_index", "Searches in-memory DiskANN indexes with multi-label 'OR' logic")};
@@ -465,6 +639,9 @@ int main(int argc, char **argv)
         // 标签相关性与查询扩展
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
+        optional_configs.add_options()("label_projection_dim",
+                                       po::value<uint32_t>(&label_projection_dim)->default_value(32),
+                                       "Low-dimensional projection size for label correlation centroids (0 disables)");
 
         // Output controls
         po::options_description output_controls("Output controls");
@@ -545,14 +722,14 @@ int main(int argc, char **argv)
                 return search_memory_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
                     Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                    expand_labels_k);
+                    expand_labels_k, label_projection_dim);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
                     Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                    expand_labels_k);
+                    expand_labels_k, label_projection_dim);
             }
             else if (data_type == std::string("float"))
             {
@@ -560,7 +737,7 @@ int main(int argc, char **argv)
                 return search_memory_index<float, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
                     Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                    expand_labels_k);
+                    expand_labels_k, label_projection_dim);
             }
             else
             {
@@ -575,21 +752,21 @@ int main(int argc, char **argv)
                 return search_memory_index<int8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                    num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                    show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                   expand_labels_k);
+                                                   expand_labels_k, label_projection_dim);
             }
             else if (data_type == std::string("uint8"))
             {
                 return search_memory_index<uint8_t>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                     num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                     show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                    expand_labels_k);
+                                                    expand_labels_k, label_projection_dim);
             }
             else if (data_type == std::string("float"))
             {
                 return search_memory_index<float>(metric, index_path_prefix, result_path, query_file, gt_file,
                                                   num_threads, K, print_all_recalls, Lvec, dynamic, tags,
                                                   show_qps_per_thread, query_filters_file, fail_if_recall_below,
-                                                  expand_labels_k);
+                                                  expand_labels_k, label_projection_dim);
             }
             else
             {

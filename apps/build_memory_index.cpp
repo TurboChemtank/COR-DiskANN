@@ -31,6 +31,9 @@ int main(int argc, char **argv)
     bool post_build_label_processing = false;
     // 【新增参数】查询时扩展的相关标签个数K（默认0不扩展）
     uint32_t expand_labels_k = 0;
+    uint32_t label_projection_dim = 32;
+    float filter_lazy_update_ratio = 0.01f;
+    uint32_t filter_lazy_update_min_ops = 128;
 
     po::options_description desc{
         program_options_utils::make_program_description("build_memory_index", "Build a memory-based DiskANN index.")};
@@ -77,10 +80,19 @@ int main(int argc, char **argv)
         // 【新增可选参数】查询时扩展Top-K相关标签
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
+        optional_configs.add_options()("label_projection_dim",
+                                       po::value<uint32_t>(&label_projection_dim)->default_value(32),
+                                       "Low-dimensional projection size for label correlation centroids (0 disables)");
         // 【新增可选参数】仅在建图后处理标签与相关性（不走过滤建图）
         optional_configs.add_options()("post_build_label_processing",
                                        po::bool_switch(&post_build_label_processing)->default_value(false),
                                        "Post-process labels after building a vanilla graph (default false)");
+        optional_configs.add_options()("filter_lazy_update_ratio",
+                                       po::value<float>(&filter_lazy_update_ratio)->default_value(0.01f),
+                                       "Lazy update trigger ratio for filter metadata (default 0.01)");
+        optional_configs.add_options()("filter_lazy_update_min_ops",
+                                       po::value<uint32_t>(&filter_lazy_update_min_ops)->default_value(128),
+                                       "Lazy update trigger minimum ops for filter metadata (default 128)");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -137,6 +149,9 @@ int main(int argc, char **argv)
                                       .with_saturate_graph(false)
                                       .with_num_threads(num_threads)
                                       .with_num_correlated_labels_to_expand(expand_labels_k)
+                                      .with_label_projection_dim(label_projection_dim)
+                                      .with_filter_lazy_update_ratio(filter_lazy_update_ratio)
+                                      .with_filter_lazy_update_min_ops(filter_lazy_update_min_ops)
                                       .build();
 
         auto filter_params = diskann::IndexFilterParamsBuilder()
