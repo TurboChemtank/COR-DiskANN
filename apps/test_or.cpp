@@ -1,20 +1,22 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include <cstring>
-#include <iomanip>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <omp.h>
 #include <queue>
-#include <set>
-#include <string.h>
-#include <boost/program_options.hpp>
-#include <fstream>
 #include <sstream>
+#include <string.h>
+#include <unordered_map>
 #include <vector>
+#include <boost/program_options.hpp>
 
 #ifndef _WINDOWS
 #include <sys/mman.h>
@@ -23,53 +25,20 @@
 #include <unistd.h>
 #endif
 
-#include "index.h"
 #include "distance.h"
-#include "memory_mapper.h"
-#include "utils.h"
-#include "program_options_utils.hpp"
+#include "index.h"
 #include "index_factory.h"
-#include "parameters.h"
+#include "memory_mapper.h"
 #include "defaults.h"
+#include "parameters.h"
+#include "program_options_utils.hpp"
+#include "utils.h"
 
 namespace po = boost::program_options;
 
-/*
- * 文件目的（工具概述）
- * -----------------------------------------------------------------------------
- * 该可执行程序用于“多标签 OR 逻辑”的过滤检索评测：对于每个查询，读取其标签集合
- * （每行逗号分隔），对集合中的每一个标签分别调用一次单标签过滤检索
- *   index->search_with_filters(query, single_label, K, L, ids, dists)
- * 然后把所有单标签的结果做并集（聚合、去重、按距离排序），再取前 K 输出。
- *
- * 与单标签版本的主要差异：
- * - 单标签版本：每个查询只执行一次 search_with_filters。
- * - 本工具：每个查询对“标签集合”中的每个标签各执行一次，再聚合。
- *
- * 注意与风险点（导致崩溃/异常的常见原因）
- * -----------------------------------------------------------------------------
- * 1) search_with_filters 内部若找不到该标签对应的 medoid（_label_to_start_id 缺失），
- *    会抛出 ANNException（如“No filtered medoid found...”）；在 OpenMP 线程内未捕获会导致
- *    terminate called recursively → 程序中止。解决：在内层单标签调用处加 try/catch 并跳过。
- *
- * 2) 查询标签与索引标签映射不一致：
- *    - 若 query_filters_file 中的某些标签字符串在构建索引时从未出现，则索引侧没有映射/medoid，
- *      该标签的检索应当跳过并不影响其他标签的 OR 聚合。
- *
- * 3) MIPS 路径下的距离符号：
- *    - 内积越大越好，代码中统一用“越小越好”的距离模型，于是以 -dot 作为排序距离；
- *      输出（或聚合）时要注意还原/转换的语义（本文件中对 MIPS 用负号做了统一处理）。
- *
- * 4) 召回评测的 ground truth
- *    - 必须使用“多标签 OR 逻辑”的真值（compute_groundtruth_for_multi_filters 生成）；
- *      若错用单标签真值，会导致评测结果不对（Recall 计算不匹配）。
- */
-// 新增：辅助函数，用于解析逗号分隔的多标签文件
-// (与 compute_groundtruth_for_multi_filters.cpp 中的函数相同)
+// 中文说明：逐行解析查询标签文件；每行是一个查询的 OR 标签集合，逗号分隔。
 std::vector<std::vector<std::string>> parse_query_filters_file(const std::string &filename)
 {
-    // 逐行读取，每行表示一个查询的标签集合；每行中逗号分隔多个标签字符串
-    // 例如：label_A,label_B,label_C
     std::vector<std::vector<std::string>> query_filters;
     std::ifstream file(filename);
     if (!file.is_open())
@@ -202,20 +171,63 @@ void build_dynamic_groundtruth(diskann::AbstractIndex &index, diskann::Metric me
     std::cout << "Dynamic ground truth built." << std::endl;
 }
 
+// 中文说明：把一次子搜索结果 merge 到总结果里；若同一 id 出现多次，只保留更优距离。
+inline void merge_partial_results(const uint32_t *ids, const float *dists, size_t k, diskann::Metric metric,
+                                  std::unordered_map<uint32_t, float> &best_dist_by_id)
+{
+    for (size_t i = 0; i < k; i++)
+    {
+        if (!std::isfinite(dists[i]))
+        {
+            continue;
+        }
+
+        const float sortable_dist = metric == diskann::Metric::INNER_PRODUCT ? -dists[i] : dists[i];
+        auto it = best_dist_by_id.find(ids[i]);
+        if (it == best_dist_by_id.end() || sortable_dist < it->second)
+        {
+            best_dist_by_id[ids[i]] = sortable_dist;
+        }
+    }
+}
+
+// 中文说明：把 merge 完的候选按距离排序后写回最终 top-k。
+inline void write_merged_topk(const std::unordered_map<uint32_t, float> &best_dist_by_id, size_t k,
+                              diskann::Metric metric, uint32_t *out_ids, float *out_dists)
+{
+    std::vector<std::pair<float, uint32_t>> ordered;
+    ordered.reserve(best_dist_by_id.size());
+    for (const auto &kv : best_dist_by_id)
+    {
+        ordered.emplace_back(kv.second, kv.first);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second); });
+
+    size_t pos = 0;
+    for (; pos < k && pos < ordered.size(); pos++)
+    {
+        out_ids[pos] = ordered[pos].second;
+        out_dists[pos] = metric == diskann::Metric::INNER_PRODUCT ? -ordered[pos].first : ordered[pos].first;
+    }
+    for (; pos < k; pos++)
+    {
+        out_ids[pos] = 0;
+        out_dists[pos] = std::numeric_limits<float>::infinity();
+    }
+}
+
 template <typename T, typename LabelT = uint32_t>
 int search_memory_index(diskann::Metric &metric, const std::string &index_path, const std::string &result_path_prefix,
                         const std::string &query_file, const std::string &truthset_file, const uint32_t num_threads,
                         const uint32_t recall_at, const bool print_all_recalls, const std::vector<uint32_t> &Lvec,
                         const bool dynamic, const bool tags, const bool show_qps_per_thread,
-                        const std::string &query_filters_file, // 修改：接收文件路径
-                        const float fail_if_recall_below, const uint32_t expand_labels_k,
-                        const uint32_t label_projection_dim)
+                        const std::string &query_filters_file, const float fail_if_recall_below,
+                        const uint32_t expand_labels_k, const uint32_t label_projection_dim)
 {
     using TagT = uint32_t;
-    using IdType = uint32_t; // 内存索引通常使用 uint32_t 作为ID
+    using ConcreteIndex = diskann::Index<T, TagT, LabelT>;
 
-    // 加载查询文件
-    // - load_aligned_bin 会把查询向量按对齐维度加载到对齐内存，便于后续 SIMD 距离计算
     T *query = nullptr;
     uint32_t *gt_ids = nullptr;
     float *gt_dists = nullptr;
@@ -226,8 +238,6 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     std::string dynamic_gt_output_file;
     diskann::load_aligned_bin<T>(query_file, query, query_num, query_dim, query_aligned_dim);
 
-    // 加载真值文件
-    // - 若提供了“OR 真值”文件，将在末尾打印 Recall 指标
     bool calc_recall_flag = false;
     if (truthset_file != std::string("null") && file_exists(truthset_file))
     {
@@ -264,11 +274,15 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
         diskann::cout << " Truthset file " << truthset_file << " not found. Not computing recall." << std::endl;
     }
 
-    // --- 加载索引 ---
-    // - 读取图头，确定冻点数量等；随后 load() 载入数据与图
-    const size_t num_frozen_pts = diskann::get_graph_num_frozen_points(index_path);
+    auto query_label_sets = parse_query_filters_file(query_filters_file);
+    if (query_label_sets.size() != query_num)
+    {
+        throw diskann::ANNException("Number of queries in query file and query filters file do not match", -1,
+                                    __FUNCSIG__, __FILE__, __LINE__);
+    }
+    std::cout << "Query filters file loaded." << std::endl;
 
-    // 写入参数：仅用于“查询时标签扩展K”
+    const size_t num_frozen_pts = diskann::get_graph_num_frozen_points(index_path);
     auto write_params =
         diskann::IndexWriteParametersBuilder(diskann::defaults::SEARCH_LIST_SIZE, diskann::defaults::MAX_DEGREE)
             .with_num_threads(num_threads)
@@ -280,7 +294,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     auto config = diskann::IndexConfigBuilder()
                       .with_metric(metric)
                       .with_dimension(query_dim)
-                      .with_max_points(0) // 在加载时通常设为0
+                      .with_max_points(0)
                       .with_data_load_store_strategy(diskann::DataStoreStrategy::MEMORY)
                       .with_graph_load_store_strategy(diskann::GraphStoreStrategy::MEMORY)
                       .with_data_type(diskann_type_to_name<T>())
@@ -292,7 +306,6 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                       .is_concurrent_consolidate(false)
                       .is_pq_dist_build(false)
                       .is_use_opq(false)
-                      // 中文说明：COR 动态索引当前保存的是纯 ANNS 图，加载时必须保持相同语义。
                       .is_filtered(false)
                       .with_num_pq_chunks(0)
                       .with_num_frozen_pts(num_frozen_pts)
@@ -302,34 +315,27 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
     auto index = index_factory.create_instance();
     index->load(index_path.c_str(), num_threads, *(std::max_element(Lvec.begin(), Lvec.end())));
     std::cout << "Index loaded" << std::endl;
-
-    // 设置查询阶段标签扩展K（可覆盖构造时值）
     index->set_expand_labels_k(expand_labels_k);
 
-    // --- 加载查询标签（字符串），不在此处转换为 LabelT ---
-    // - 这里直接把字符串作为 raw_label 传入 search_with_filters；
-    //   内部会调用索引的标签映射，若找不到映射/medoid 会抛异常（需要上层注意处理）
-    auto query_label_sets = parse_query_filters_file(query_filters_file);
-    if (query_label_sets.size() != query_num)
+    auto *typed_index = dynamic_cast<ConcreteIndex *>(index.get());
+    if (typed_index == nullptr)
     {
-        throw diskann::ANNException("Number of queries in query file and query filters file do not match", -1,
-                                    __FUNCSIG__, __FILE__, __LINE__);
+        throw diskann::ANNException("Failed to cast abstract index to concrete memory index", -1, __FUNCSIG__,
+                                    __FILE__, __LINE__);
     }
-    std::cout << "Query filters file loaded." << std::endl;
 
-    // ... (优化的索引布局逻辑保持不变)
     if (metric == diskann::FAST_L2)
+    {
         index->optimize_index_layout();
+    }
 
-    // --- 准备输出 ---
     std::cout << "Using " << num_threads << " threads to search" << std::endl;
     std::cout.setf(std::ios_base::fixed, std::ios_base::floatfield);
     std::cout.precision(2);
     const std::string qps_title = show_qps_per_thread ? "QPS/thread" : "QPS";
     uint32_t table_width = 0;
-    // (省略了 'tags' 的特殊表格格式，专注于过滤搜索)
-    std::cout << std::setw(4) << "Ls" << std::setw(12) << qps_title << std::setw(18) << "Avg dist cmps" << std::setw(20)
-              << "Mean Latency (mus)" << std::setw(15) << "99.9 Latency";
+    std::cout << std::setw(4) << "Ls" << std::setw(12) << qps_title << std::setw(18) << "Avg dist cmps"
+              << std::setw(20) << "Mean Latency (mus)" << std::setw(15) << "99.9 Latency";
     table_width += 4 + 12 + 18 + 20 + 15;
 
     uint32_t recalls_to_print = 0;
@@ -354,164 +360,204 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
 
     double best_recall = 0.0;
 
-    
-    
-    
-    
-    
-    
-    
-    // std::cout<<index->get_filter_frequency_threshold()<<std::endl;
-    // std::cout<<"check:\n"<<std::endl;
-    // index->check_label_frequency();
-    // std::cout<<"check end\n"<<std::endl;
-    
-    
-    
-    
-    
-    
-    
     for (uint32_t test_id = 0; test_id < Lvec.size(); test_id++)
     {
-        uint32_t L = Lvec[test_id];
+        const uint32_t L = Lvec[test_id];
         if (L < recall_at)
         {
             diskann::cout << "Ignoring search with L:" << L << " since it's smaller than K:" << recall_at << std::endl;
             continue;
         }
-        
-        
-        std::cout<<"check:\n"<<std::endl;
-        
+
         query_result_ids[test_id].resize(recall_at * query_num);
         query_result_dists[test_id].resize(recall_at * query_num);
 
         auto s = std::chrono::high_resolution_clock::now();
         omp_set_num_threads(num_threads);
 
-        // --- 核心修改：并行搜索循环 ---
 #pragma omp parallel for schedule(dynamic, 1)
         for (int64_t i = 0; i < (int64_t)query_num; i++)
         {
-            // 每个查询独立：对其“多标签集合”逐个执行单标签检索，并聚合结果
-            auto qs = std::chrono::high_resolution_clock::now(); // 开始计时
-
+            auto qs = std::chrono::high_resolution_clock::now();
             const T *query_vec = query + i * query_aligned_dim;
-            const auto &current_query_labels = query_label_sets[i];
+            std::vector<std::string> current_query_labels = query_label_sets[(size_t)i];
+            std::sort(current_query_labels.begin(), current_query_labels.end());
+            current_query_labels.erase(std::unique(current_query_labels.begin(), current_query_labels.end()),
+                                       current_query_labels.end());
+
+            const uint32_t threshold = index->get_filter_frequency_threshold();
+            const double low_cutoff = static_cast<double>(threshold) * 0.01;
+            std::vector<std::string> high_freq_labels;
+            std::vector<std::string> mid_freq_labels;
+            std::vector<std::string> low_freq_labels;
+            high_freq_labels.reserve(current_query_labels.size());
+            mid_freq_labels.reserve(current_query_labels.size());
+            low_freq_labels.reserve(current_query_labels.size());
+
+            for (const auto &label : current_query_labels)
+            {
+                const uint32_t freq = index->get_filter_frequency(label);
+                if (freq > threshold)
+                {
+                    high_freq_labels.emplace_back(label);
+                }
+                else if (static_cast<double>(freq) > low_cutoff)
+                {
+                    mid_freq_labels.emplace_back(label);
+                }
+                else
+                {
+                    low_freq_labels.emplace_back(label);
+                }
+            }
+
+            std::unordered_map<uint32_t, float> merged_best;
+            merged_best.reserve(std::max<size_t>(1, current_query_labels.size() * recall_at));
+            std::vector<uint32_t> temp_ids(recall_at, 0);
+            std::vector<TagT> temp_tags(recall_at, TagT{});
+            std::vector<float> temp_dists(recall_at, std::numeric_limits<float>::infinity());
+            std::vector<T *> temp_res_vectors;
             uint32_t current_cmp_stats = 0;
 
-            // 1. 创建聚合池 (自动排序和去重)
-            std::set<diskann::Neighbor> aggregated_results;
+            auto merge_ids = [&]() {
+                merge_partial_results(temp_ids.data(), temp_dists.data(), recall_at, metric, merged_best);
+            };
+            auto merge_tags = [&]() {
+                merge_partial_results(temp_tags.data(), temp_dists.data(), recall_at, metric, merged_best);
+            };
 
-            // 2. 创建线程本地的临时缓冲区
-            std::vector<IdType> temp_ids(recall_at);
-            std::vector<TagT> temp_tags(recall_at);
-            std::vector<float> temp_dists(recall_at);
-            std::vector<T *> temp_res_vectors;
-
-            // 3. 执行“OR”查询（新内循环）
-            for (const auto &single_label_str : current_query_labels)
+            // 中文说明：高频标签单独做一次普通过滤搜索，不做标签扩展。
+            for (const auto &label : high_freq_labels)
             {
-                // 【新增逻辑 - 中文说明】
-                // 先按“标签频率<=门槛值”决定该标签是否启用扩展搜索：
-                // - 低频标签：启用扩展（use_expand=1）
-                // - 高频标签：不扩展（use_expand=0）
-                uint32_t freq = index->get_filter_frequency(single_label_str);
-                uint32_t threshold = index->get_filter_frequency_threshold();
-                
-                // threshold = 8000;
-                
-                const uint32_t use_expand = (freq <= threshold) ? expand_labels_k : 1u;
-
-                // 3a. 执行单标签搜索
-                // 显式将查询向量封装为 std::any，避免 any_cast 类型不匹配导致的异常；
-                // 同时用 try/catch 防御 OpenMP 线程内异常导致的进程终止。
                 try
                 {
                     if (dynamic && tags)
                     {
-                        index->search_with_tags(query_vec, recall_at, L, temp_tags.data(), temp_dists.data(),
-                                                temp_res_vectors, true, single_label_str, (int)use_expand);
+                        auto retval = typed_index->search_with_filter_label_group_tags(
+                            query_vec, recall_at, L, temp_tags.data(), temp_dists.data(), temp_res_vectors, {label}, 0,
+                            true);
+                        current_cmp_stats += retval.second;
+                        merge_tags();
                     }
                     else
                     {
-                        std::any any_query = static_cast<const T *>(query_vec);
-                        auto retval = index->search_with_filters(any_query, single_label_str, recall_at, L, use_expand,
-                                                                 temp_ids.data(), temp_dists.data());
-                        current_cmp_stats += retval.second; // 累加比较次数
+                        auto retval = typed_index->search_with_filter_label_group(
+                            query_vec, {label}, recall_at, L, temp_ids.data(), temp_dists.data(), 0, true);
+                        current_cmp_stats += retval.second;
+                        merge_ids();
                     }
-                }
-                catch (const std::bad_any_cast &)
-                {
-                    // 该标签检索失败（类型擦除传递失败），跳过本标签
-                    continue;
                 }
                 catch (const std::exception &)
                 {
-                    // 包含：标签无 medoid（No filtered medoid found...）等场景，均跳过该标签
-                    continue;
-                }
-
-                // 3b. 聚合结果
-                for (size_t j = 0; j < recall_at; ++j)
-                {
-                    if (temp_dists[j] != std::numeric_limits<float>::infinity())
+                    // 中文说明：若常规过滤搜索因为缺少 medoid 等原因失败，则回退到倒排爆搜保证可用性。
+                    if (dynamic && tags)
                     {
-                        // 使用 MIPS 调整后的距离（如果适用）进行排序
-                        float dist_for_comp =
-                            (metric == diskann::Metric::INNER_PRODUCT) ? -temp_dists[j] : temp_dists[j];
-                        const uint32_t result_id =
-                            (dynamic && tags) ? static_cast<uint32_t>(temp_tags[j]) : static_cast<uint32_t>(temp_ids[j]);
-                        aggregated_results.insert(diskann::Neighbor(result_id, dist_for_comp));
+                        auto retval = typed_index->brute_force_search_filter_label_tags(
+                            query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
+                        current_cmp_stats += retval.second;
+                        merge_tags();
+                    }
+                    else
+                    {
+                        auto retval = typed_index->brute_force_search_filter_label(
+                            query_vec, label, recall_at, temp_ids.data(), temp_dists.data());
+                        current_cmp_stats += retval.second;
+                        merge_ids();
                     }
                 }
             }
 
-            // 4. 提取最终 Top-K
-            // - set<Neighbor> 默认按 distance 从小到大排序（见 Neighbor::operator< 实现）
-            // - 这里顺序遍历即得到最小的 K 个；MIPS 已在插入时做了负号处理，回写时再还原
-            size_t pos = 0;
-            for (const auto &neighbor : aggregated_results)
+            // 中文说明：中频标签合并成一次 OR 搜索，起点只放各标签 medoid，并允许相关标签扩展。
+            if (!mid_freq_labels.empty())
             {
-                if (pos >= recall_at) // 只需要 K (recall_at) 个
-                    break;
-
-                query_result_ids[test_id][i * recall_at + pos] = neighbor.id;
-                // 转换回原始距离（为MIPS还原符号）
-                query_result_dists[test_id][i * recall_at + pos] =
-                    (metric == diskann::Metric::INNER_PRODUCT) ? -neighbor.distance : neighbor.distance;
-                pos++;
+                try
+                {
+                    if (dynamic && tags)
+                    {
+                        auto retval = typed_index->search_with_filter_label_group_tags(
+                            query_vec, recall_at, L, temp_tags.data(), temp_dists.data(), temp_res_vectors,
+                            mid_freq_labels, (int)expand_labels_k, false);
+                        current_cmp_stats += retval.second;
+                        merge_tags();
+                    }
+                    else
+                    {
+                        auto retval = typed_index->search_with_filter_label_group(
+                            query_vec, mid_freq_labels, recall_at, L, temp_ids.data(), temp_dists.data(),
+                            (int)expand_labels_k, false);
+                        current_cmp_stats += retval.second;
+                        merge_ids();
+                    }
+                }
+                catch (const std::exception &)
+                {
+                    // 中文说明：合并搜索失败时，退化成逐标签倒排爆搜，保证结果仍然完整。
+                    for (const auto &label : mid_freq_labels)
+                    {
+                        if (dynamic && tags)
+                        {
+                            auto retval = typed_index->brute_force_search_filter_label_tags(
+                                query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
+                            current_cmp_stats += retval.second;
+                            merge_tags();
+                        }
+                        else
+                        {
+                            auto retval = typed_index->brute_force_search_filter_label(
+                                query_vec, label, recall_at, temp_ids.data(), temp_dists.data());
+                            current_cmp_stats += retval.second;
+                            merge_ids();
+                        }
+                    }
+                }
             }
-            // 填充不足 K 的部分
-            while (pos < recall_at)
+
+            // 中文说明：超低频标签直接走倒排索引，把 posting 全部拿出来爆搜。
+            for (const auto &label : low_freq_labels)
             {
-                query_result_ids[test_id][i * recall_at + pos] = 0;
-                query_result_dists[test_id][i * recall_at + pos] = std::numeric_limits<float>::infinity();
-                pos++;
+                if (dynamic && tags)
+                {
+                    auto retval = typed_index->brute_force_search_filter_label_tags(
+                        query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
+                    current_cmp_stats += retval.second;
+                    merge_tags();
+                }
+                else
+                {
+                    auto retval =
+                        typed_index->brute_force_search_filter_label(query_vec, label, recall_at, temp_ids.data(),
+                                                                     temp_dists.data());
+                    current_cmp_stats += retval.second;
+                    merge_ids();
+                }
             }
 
-            auto qe = std::chrono::high_resolution_clock::now(); // 停止计时
-            std::chrono::duration<double> diff = qe - qs;
-            latency_stats[i] = (float)(diff.count() * 1000000);
+            write_merged_topk(merged_best, recall_at, metric, query_result_ids[test_id].data() + i * recall_at,
+                              query_result_dists[test_id].data() + i * recall_at);
             cmp_stats[i] = current_cmp_stats;
-        }
-        std::chrono::duration<double> diff = std::chrono::high_resolution_clock::now() - s;
 
-        // --- 性能统计暂存，待真值准备好后统一输出 ---
+            auto qe = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> diff = qe - qs;
+            latency_stats[(size_t)i] = (float)(diff.count() * 1000000);
+        }
+
+        std::chrono::duration<double> diff = std::chrono::high_resolution_clock::now() - s;
         double displayed_qps = query_num / diff.count();
         if (show_qps_per_thread)
+        {
             displayed_qps /= num_threads;
+        }
 
         std::sort(latency_stats.begin(), latency_stats.end());
-        double mean_latency =
-            std::accumulate(latency_stats.begin(), latency_stats.end(), 0.0) / static_cast<float>(query_num);
+        const double mean_latency =
+            std::accumulate(latency_stats.begin(), latency_stats.end(), 0.0) / static_cast<double>(query_num);
+        const float avg_cmps = static_cast<float>(std::accumulate(cmp_stats.begin(), cmp_stats.end(), 0ULL) /
+                                                  static_cast<double>(query_num));
 
-        float avg_cmps = (float)std::accumulate(cmp_stats.begin(), cmp_stats.end(), 0) / (float)query_num;
         run_stats[test_id].displayed_qps = displayed_qps;
         run_stats[test_id].avg_cmps = avg_cmps;
         run_stats[test_id].mean_latency = (float)mean_latency;
-        run_stats[test_id].p999_latency = (float)latency_stats[(uint64_t)(0.999 * query_num)];
+        run_stats[test_id].p999_latency = latency_stats[(uint64_t)(0.999 * query_num)];
         run_stats[test_id].valid = true;
     }
 
@@ -526,7 +572,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
 
     for (uint32_t test_id = 0; test_id < Lvec.size(); test_id++)
     {
-        uint32_t L = Lvec[test_id];
+        const uint32_t L = Lvec[test_id];
         if (L < recall_at || !run_stats[test_id].valid)
         {
             continue;
@@ -549,31 +595,27 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
         for (double recall : recalls)
         {
             std::cout << std::setw(12) << recall;
-            best_recall = std::max(recall, best_recall);
+            best_recall = std::max(best_recall, recall);
         }
         std::cout << std::endl;
     }
 
-    // --- 保存结果 (不变) ---
     std::cout << "Done searching. Now saving results " << std::endl;
-    uint64_t test_id = 0;
-    for (auto L : Lvec)
+    for (size_t test_id = 0; test_id < Lvec.size(); test_id++)
     {
-        // 为每个 L 输出一份结果（ids 与 dists 分别保存）
+        const auto L = Lvec[test_id];
         if (L < recall_at)
         {
             diskann::cout << "Ignoring search with L:" << L << " since it's smaller than K:" << recall_at << std::endl;
             continue;
         }
-        std::string cur_result_path_prefix = result_path_prefix + "_" + std::to_string(L);
 
+        const std::string cur_result_path_prefix = result_path_prefix + "_" + std::to_string(L);
         std::string cur_result_path = cur_result_path_prefix + "_idx_uint32.bin";
         diskann::save_bin<uint32_t>(cur_result_path, query_result_ids[test_id].data(), query_num, recall_at);
 
         cur_result_path = cur_result_path_prefix + "_dists_float.bin";
         diskann::save_bin<float>(cur_result_path, query_result_dists[test_id].data(), query_num, recall_at);
-
-        test_id++;
     }
 
     diskann::aligned_free(query);
@@ -583,7 +625,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
 int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, index_path_prefix, result_path, query_file, gt_file, label_type,
-        query_filters_file; // 移除了 filter_label
+        query_filters_file;
     uint32_t num_threads, K;
     std::vector<uint32_t> Lvec;
     bool print_all_recalls, dynamic, tags, show_qps_per_thread;
@@ -591,13 +633,12 @@ int main(int argc, char **argv)
     uint32_t expand_labels_k = 0;
     uint32_t label_projection_dim = 32;
 
-    po::options_description desc{program_options_utils::make_program_description(
-        "multi_filters_search_memory_index", "Searches in-memory DiskANN indexes with multi-label 'OR' logic")};
+    po::options_description desc{
+        program_options_utils::make_program_description("test_or", "Searches in-memory DiskANN indexes with new OR logic")};
     try
     {
         desc.add_options()("help,h", "Print this information on arguments");
 
-        // Required parameters
         po::options_description required_configs("Required");
         required_configs.add_options()("data_type", po::value<std::string>(&data_type)->required(),
                                        program_options_utils::DATA_TYPE_DESCRIPTION);
@@ -614,12 +655,10 @@ int main(int argc, char **argv)
         required_configs.add_options()("search_list,L",
                                        po::value<std::vector<uint32_t>>(&Lvec)->multitoken()->required(),
                                        program_options_utils::SEARCH_LIST_DESCRIPTION);
-        // --- 修改：移除 filter_label，使 query_filters_file 成为必需 ---
         required_configs.add_options()(
             "query_filters_file", po::value<std::string>(&query_filters_file)->required(),
             "Path to query filters file. Each line contains comma-separated labels for the corresponding query.");
 
-        // Optional parameters
         po::options_description optional_configs("Optional");
         optional_configs.add_options()("label_type", po::value<std::string>(&label_type)->default_value("uint"),
                                        program_options_utils::LABEL_TYPE_DESCRIPTION);
@@ -630,29 +669,24 @@ int main(int argc, char **argv)
                                        program_options_utils::NUMBER_THREADS_DESCRIPTION);
         optional_configs.add_options()(
             "dynamic", po::value<bool>(&dynamic)->default_value(false),
-            "Whether the index is dynamic. Dynamic indices must have associated tags.  Default false.");
+            "Whether the index is dynamic. Dynamic indices must have associated tags. Default false.");
         optional_configs.add_options()("tags", po::value<bool>(&tags)->default_value(false),
                                        "Whether to search with external identifiers (tags). Default false.");
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
-        // 标签相关性与查询扩展
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Expand to Top-K correlated labels at query time (default 0)");
         optional_configs.add_options()("label_projection_dim",
                                        po::value<uint32_t>(&label_projection_dim)->default_value(32),
                                        "Deprecated compatibility option. Kept for CLI compatibility but ignored.");
 
-        // Output controls
         po::options_description output_controls("Output controls");
         output_controls.add_options()("print_all_recalls", po::bool_switch(&print_all_recalls),
-                                      "Print recalls at all positions, from 1 up to specified "
-                                      "recall_at value");
+                                      "Print recalls at all positions, from 1 up to specified recall_at value");
         output_controls.add_options()("print_qps_per_thread", po::bool_switch(&show_qps_per_thread),
-                                      "Print overall QPS divided by the number of threads in "
-                                      "the output table");
+                                      "Print overall QPS divided by the number of threads in the output table");
 
-        // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs).add(output_controls);
 
         po::variables_map vm;
@@ -670,7 +704,6 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // ... (metric, dynamic/tags, fail_if_recall_below 检查保持不变) ...
     diskann::Metric metric;
     if ((dist_fn == std::string("mips")) && (data_type == std::string("float")))
     {
@@ -690,14 +723,13 @@ int main(int argc, char **argv)
     }
     else
     {
-        std::cout << "Unsupported distance function. Currently only l2/ cosine are "
-                     "supported in general, and mips/fast_l2 only for floating "
-                     "point data."
+        std::cout << "Unsupported distance function. Currently only l2/cosine are supported in general, and "
+                     "mips/fast_l2 only for floating point data."
                   << std::endl;
         return -1;
     }
 
-    if (dynamic && not tags)
+    if (dynamic && !tags)
     {
         std::cerr << "Tags must be enabled while searching dynamically built indices" << std::endl;
         return -1;
@@ -709,12 +741,8 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // --- 移除 filter_label 和 query_filters_file 的冲突检查 ---
-    // (因为 query_filters_file 是唯一且必需的)
-
     try
     {
-        // 根据标签和数据类型调用模板函数
         if (label_type == "ushort")
         {
             if (data_type == std::string("int8"))
@@ -733,19 +761,13 @@ int main(int argc, char **argv)
             }
             else if (data_type == std::string("float"))
             {
-                std::cout << "check1" << std::endl;
                 return search_memory_index<float, uint16_t>(
                     metric, index_path_prefix, result_path, query_file, gt_file, num_threads, K, print_all_recalls,
                     Lvec, dynamic, tags, show_qps_per_thread, query_filters_file, fail_if_recall_below,
                     expand_labels_k, label_projection_dim);
             }
-            else
-            {
-                std::cout << "Unsupported type. Use float/int8/uint8" << std::endl;
-                return -1;
-            }
         }
-        else // 默认为 uint (uint32_t)
+        else
         {
             if (data_type == std::string("int8"))
             {
@@ -768,12 +790,10 @@ int main(int argc, char **argv)
                                                   show_qps_per_thread, query_filters_file, fail_if_recall_below,
                                                   expand_labels_k, label_projection_dim);
             }
-            else
-            {
-                std::cout << "Unsupported type. Use float/int8/uint8" << std::endl;
-                return -1;
-            }
         }
+
+        std::cout << "Unsupported type. Use float/int8/uint8" << std::endl;
+        return -1;
     }
     catch (std::exception &e)
     {

@@ -514,7 +514,7 @@ int main(int argc, char **argv)
         optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
                                        "Kept only for config compatibility");
         optional_configs.add_options()("label_projection_dim", po::value<uint32_t>(&label_projection_dim)->default_value(32),
-                                       "Low-dimensional projection size for label correlation centroids (0 disables)");
+                                       "Deprecated compatibility option. Kept for CLI compatibility but ignored.");
         optional_configs.add_options()("save_final_index",
                                        po::bool_switch(&save_final_index)->default_value(false),
                                        "Save final compacted index");

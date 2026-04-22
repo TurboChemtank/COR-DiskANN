@@ -63,7 +63,7 @@ class AbstractIndex
     template <typename data_type, typename tag_type>
     size_t search_with_tags(const data_type *query, const uint64_t K, const uint32_t L, tag_type *tags,
                             float *distances, std::vector<data_type *> &res_vectors, bool use_filters = false,
-                            const std::string filter_label = "");
+                            const std::string filter_label = "", const int expand_num = -1);
 
     // Added search overload that takes L as parameter, so that we
     // can customize L on a per-query basis without tampering with "Parameters"
@@ -106,6 +106,8 @@ class AbstractIndex
 
     template <typename data_type> void set_start_points_at_random(data_type radius, uint32_t random_seed = 0);
 
+    template <typename tag_type> bool matches_any_labels(const tag_type &tag, const std::vector<std::string> &raw_labels);
+
     virtual consolidation_report consolidate_deletes(const IndexWriteParameters &parameters) = 0;
 
     virtual void optimize_index_layout() = 0;
@@ -141,10 +143,11 @@ class AbstractIndex
     virtual void _lazy_delete(TagVector &tags, TagVector &failed_tags) = 0;
     virtual void _get_active_tags(TagRobinSet &active_tags) = 0;
     virtual void _set_start_points_at_random(DataType radius, uint32_t random_seed = 0) = 0;
+    virtual bool _matches_any_labels(const TagType &tag, const std::vector<std::string> &raw_labels) = 0;
     virtual int _get_vector_by_tag(TagType &tag, DataType &vec) = 0;
     virtual size_t _search_with_tags(const DataType &query, const uint64_t K, const uint32_t L, const TagType &tags,
                                      float *distances, DataVector &res_vectors, bool use_filters = false,
-                                     const std::string filter_label = "") = 0;
+                                     const std::string filter_label = "", const int expand_num = -1) = 0;
     virtual void _search_with_optimized_layout(const DataType &query, size_t K, size_t L, uint32_t *indices) = 0;
     virtual void _set_universal_label(const LabelType universal_label) = 0;
 };

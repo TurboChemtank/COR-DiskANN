@@ -25,7 +25,7 @@ class IndexWriteParameters
     const uint32_t filter_list_size; // Lf
     // 【新增参数】查询时扩展相关标签的数量（K），默认0表示不扩展
     const uint32_t num_correlated_labels_to_expand;
-    // 标签相关度计算使用的低维投影维度，0表示关闭投影
+    // 兼容保留参数：旧版用于低维投影，当前实现已忽略该值
     const uint32_t label_projection_dim;
     // 标签元数据懒更新触发阈值：达到 max(nd*ratio, min_ops) 时批量刷新
     const float filter_lazy_update_ratio;
@@ -111,7 +111,7 @@ class IndexWriteParametersBuilder
         return *this;
     }
 
-    // 设置标签相关度计算的低维投影维度，0表示关闭
+    // 兼容保留接口：旧版用于低维投影，当前实现仅透传该值而不再使用
     IndexWriteParametersBuilder &with_label_projection_dim(const uint32_t dim)
     {
         _label_projection_dim = dim;

@@ -82,7 +82,7 @@ int main(int argc, char **argv)
                                        "Expand to Top-K correlated labels at query time (default 0)");
         optional_configs.add_options()("label_projection_dim",
                                        po::value<uint32_t>(&label_projection_dim)->default_value(32),
-                                       "Low-dimensional projection size for label correlation centroids (0 disables)");
+                                       "Deprecated compatibility option. Kept for CLI compatibility but ignored.");
         // 【新增可选参数】仅在建图后处理标签与相关性（不走过滤建图）
         optional_configs.add_options()("post_build_label_processing",
                                        po::bool_switch(&post_build_label_processing)->default_value(false),

@@ -25,12 +25,13 @@ std::pair<uint32_t, uint32_t> AbstractIndex::search(const data_type *query, cons
 template <typename data_type, typename tag_type>
 size_t AbstractIndex::search_with_tags(const data_type *query, const uint64_t K, const uint32_t L, tag_type *tags,
                                        float *distances, std::vector<data_type *> &res_vectors, bool use_filters,
-                                       const std::string filter_label)
+                                       const std::string filter_label, const int expand_num)
 {
     auto any_query = std::any(query);
     auto any_tags = std::any(tags);
     auto any_res_vectors = DataVector(res_vectors);
-    return this->_search_with_tags(any_query, K, L, any_tags, distances, any_res_vectors, use_filters, filter_label);
+    return this->_search_with_tags(any_query, K, L, any_tags, distances, any_res_vectors, use_filters, filter_label,
+                                   expand_num);
 }
 
 template <typename IndexType>
@@ -102,6 +103,13 @@ template <typename data_type> void AbstractIndex::set_start_points_at_random(dat
 {
     auto any_radius = std::any(radius);
     this->_set_start_points_at_random(any_radius, random_seed);
+}
+
+template <typename tag_type>
+bool AbstractIndex::matches_any_labels(const tag_type &tag, const std::vector<std::string> &raw_labels)
+{
+    auto any_tag = std::any(tag);
+    return this->_matches_any_labels(any_tag, raw_labels);
 }
 
 template <typename tag_type, typename data_type> int AbstractIndex::get_vector_by_tag(tag_type &tag, data_type *vec)
@@ -185,51 +193,51 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> AbstractIndex::search_w
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<float, int32_t>(
     const float *query, const uint64_t K, const uint32_t L, int32_t *tags, float *distances,
-    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<uint8_t, int32_t>(
     const uint8_t *query, const uint64_t K, const uint32_t L, int32_t *tags, float *distances,
-    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<int8_t, int32_t>(
     const int8_t *query, const uint64_t K, const uint32_t L, int32_t *tags, float *distances,
-    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<float, uint32_t>(
     const float *query, const uint64_t K, const uint32_t L, uint32_t *tags, float *distances,
-    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<uint8_t, uint32_t>(
     const uint8_t *query, const uint64_t K, const uint32_t L, uint32_t *tags, float *distances,
-    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<int8_t, uint32_t>(
     const int8_t *query, const uint64_t K, const uint32_t L, uint32_t *tags, float *distances,
-    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<float, int64_t>(
     const float *query, const uint64_t K, const uint32_t L, int64_t *tags, float *distances,
-    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<uint8_t, int64_t>(
     const uint8_t *query, const uint64_t K, const uint32_t L, int64_t *tags, float *distances,
-    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<int8_t, int64_t>(
     const int8_t *query, const uint64_t K, const uint32_t L, int64_t *tags, float *distances,
-    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<float, uint64_t>(
     const float *query, const uint64_t K, const uint32_t L, uint64_t *tags, float *distances,
-    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<float *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<uint8_t, uint64_t>(
     const uint8_t *query, const uint64_t K, const uint32_t L, uint64_t *tags, float *distances,
-    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<uint8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT size_t AbstractIndex::search_with_tags<int8_t, uint64_t>(
     const int8_t *query, const uint64_t K, const uint32_t L, uint64_t *tags, float *distances,
-    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label);
+    std::vector<int8_t *> &res_vectors, bool use_filters, const std::string filter_label, const int expand_num);
 
 template DISKANN_DLLEXPORT void AbstractIndex::search_with_optimized_layout<float>(const float *query, size_t K,
                                                                                    size_t L, uint32_t *indices);
@@ -328,6 +336,15 @@ template DISKANN_DLLEXPORT void AbstractIndex::get_active_tags<int32_t>(tsl::rob
 template DISKANN_DLLEXPORT void AbstractIndex::get_active_tags<uint32_t>(tsl::robin_set<uint32_t> &active_tags);
 template DISKANN_DLLEXPORT void AbstractIndex::get_active_tags<int64_t>(tsl::robin_set<int64_t> &active_tags);
 template DISKANN_DLLEXPORT void AbstractIndex::get_active_tags<uint64_t>(tsl::robin_set<uint64_t> &active_tags);
+
+template DISKANN_DLLEXPORT bool AbstractIndex::matches_any_labels<int32_t>(const int32_t &tag,
+                                                                           const std::vector<std::string> &raw_labels);
+template DISKANN_DLLEXPORT bool AbstractIndex::matches_any_labels<uint32_t>(const uint32_t &tag,
+                                                                            const std::vector<std::string> &raw_labels);
+template DISKANN_DLLEXPORT bool AbstractIndex::matches_any_labels<int64_t>(const int64_t &tag,
+                                                                           const std::vector<std::string> &raw_labels);
+template DISKANN_DLLEXPORT bool AbstractIndex::matches_any_labels<uint64_t>(const uint64_t &tag,
+                                                                            const std::vector<std::string> &raw_labels);
 
 template DISKANN_DLLEXPORT void AbstractIndex::set_start_points_at_random<float>(float radius, uint32_t random_seed);
 template DISKANN_DLLEXPORT void AbstractIndex::set_start_points_at_random<uint8_t>(uint8_t radius,

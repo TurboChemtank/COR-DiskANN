@@ -137,17 +137,48 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     uint32_t get_filter_frequency(const std::string &raw_label) const override
     {
+        LabelT label{};
         auto it = _label_map.find(raw_label);
-        if (it == _label_map.end())
+        if (it != _label_map.end())
         {
-            return 0;
+            label = it->second;
         }
-        const LabelT label = it->second;
+        else
+        {
+            try
+            {
+                label = (LabelT)std::stoull(raw_label);
+            }
+            catch (const std::exception &)
+            {
+                if (_use_universal_label)
+                {
+                    label = _universal_label;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+        }
+
         if (label >= _label_frequency.size())
         {
-            return 0;
+            auto delta_it = _pending_label_frequency_delta.find(label);
+            if (delta_it == _pending_label_frequency_delta.end())
+            {
+                return 0;
+            }
+            return delta_it->second > 0 ? static_cast<uint32_t>(delta_it->second) : 0;
         }
-        return _label_frequency[label];
+
+        int64_t freq = static_cast<int64_t>(_label_frequency[label]);
+        auto delta_it = _pending_label_frequency_delta.find(label);
+        if (delta_it != _pending_label_frequency_delta.end())
+        {
+            freq += delta_it->second;
+        }
+        return freq > 0 ? static_cast<uint32_t>(freq) : 0;
     }
 
     // 【新增接口实现 - 中文说明】打印频率数组的基本信息（避免输出过多）
@@ -172,6 +203,29 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                       << " sum=" << sum << " max_freq=" << max_freq
                       << " otsu_threshold=" << _label_frequency_otsu_threshold << std::endl;
     }
+
+    // 中文说明：支持“多标签 OR 合并搜索”，可指定是否额外加入默认全局起点。
+    DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>
+    search_with_filter_label_group(const T *query, const std::vector<std::string> &raw_filter_labels, const size_t K,
+                                   const uint32_t L, uint32_t *indices, float *distances,
+                                   const int expand_num = -1, const bool include_unfiltered_starts = false);
+
+    // 中文说明：与上面相同，但输出外部 tag，便于动态索引评测。
+    DISKANN_DLLEXPORT std::pair<size_t, uint32_t>
+    search_with_filter_label_group_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
+                                        float *distances, std::vector<T *> &res_vectors,
+                                        const std::vector<std::string> &raw_filter_labels,
+                                        const int expand_num = -1, const bool include_unfiltered_starts = false);
+
+    // 中文说明：基于倒排索引直接枚举候选并爆搜单标签。
+    DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>
+    brute_force_search_filter_label(const T *query, const std::string &raw_filter_label, const size_t K,
+                                    uint32_t *indices, float *distances);
+
+    // 中文说明：基于倒排索引直接枚举候选并爆搜单标签，输出外部 tag。
+    DISKANN_DLLEXPORT std::pair<size_t, uint32_t>
+    brute_force_search_filter_label_tags(const T *query, const std::string &raw_filter_label, const uint64_t K,
+                                         TagT *tags, float *distances, std::vector<T *> &res_vectors);
 
     // Set starting point of an index before inserting any points incrementally.
     // The data count should be equal to _num_frozen_pts * _aligned_dim.
@@ -353,6 +407,16 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     void rebuild_projected_label_centroids();
     void update_projected_label_centroid(const LabelT &label);
     float compute_label_correlation_distance(const std::vector<float> &lhs, const std::vector<float> &rhs) const;
+    // 基于当前标签质心重建 KMeans 簇索引
+    void rebuild_label_centroid_clusters();
+    // 在增量刷新时，仅更新脏标签涉及到的簇划分与簇中心
+    void refresh_dirty_label_centroid_clusters(tsl::robin_set<uint32_t> &touched_clusters);
+    // 重新计算单个簇的中心向量
+    void recompute_label_cluster_center(uint32_t cluster_id);
+    // 为某个标签质心找到最近的若干个簇
+    std::vector<uint32_t> get_nearest_label_clusters(const std::vector<float> &centroid) const;
+    // 基于簇筛选候选集后，重算给定标签集合的 Top-K 相关标签
+    size_t recompute_label_top_correlations(const std::vector<LabelT> &labels);
 
     // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
     void update_label_correlations_incremental(const std::vector<LabelT> &labels);
@@ -376,8 +440,23 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     void record_delete_label_updates(uint32_t location, const TagT tag);
     // 批量更新时，仅刷新脏标签的medoid
     void refresh_dirty_label_medoids();
-    // 批量更新时，仅刷新脏标签相关性（行列）
+    // 批量更新时，基于簇筛选仅刷新受影响标签的 Top-K 相关性
     void refresh_dirty_label_correlations();
+
+    // 中文说明：把原始标签字符串转换成内部标签ID；允许直接传数值字符串。
+    bool try_convert_label(const std::string &raw_label, LabelT &label) const;
+    // 中文说明：批量转换并排序去重，忽略无法识别的标签。
+    std::vector<LabelT> convert_filter_labels(const std::vector<std::string> &raw_filter_labels) const;
+    // 中文说明：把原始查询标签与相关标签扩展合并成真正参与图遍历的过滤集合。
+    std::vector<LabelT> build_expanded_filter_labels(const std::vector<LabelT> &base_labels, int expand_num) const;
+    // 中文说明：重建“标签 -> 活跃向量 location”的倒排索引。
+    void rebuild_filter_inverted_index();
+    // 中文说明：插入时把 location 加入对应标签的倒排链。
+    void add_location_to_filter_inverted_index(uint32_t location, const std::vector<LabelT> &labels);
+    // 中文说明：删除时把 location 从对应标签的倒排链移除。
+    void remove_location_from_filter_inverted_index(uint32_t location, const std::vector<LabelT> &labels);
+    // 中文说明：收集单标签爆搜候选；若启用了 universal label，会自动合并对应 posting。
+    void collect_bruteforce_filter_candidates(const LabelT &filter_label, std::vector<uint32_t> &candidate_locations) const;
 
     template <typename IdType>
     std::pair<uint32_t, uint32_t> brute_force_search_pending_label(const T *query, const LabelT &filter_label,
@@ -497,7 +576,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t _filterIndexingQueueSize;
     std::unordered_map<std::string, LabelT> _label_map;
 
-    // 【新增成员 - 中文说明】标签相关性矩阵：存储任意两个标签的相关性分数（对称）
+    // 【新增成员 - 中文说明】标签相关性缓存：当前仅缓存已重算标签的候选相关分数
     // 采用嵌套map: labelA -> (labelB -> score)
     std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
 
@@ -506,9 +585,17 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 【新增成员 - 中文说明】每个标签的中心向量（用于基于中心距离的相关度）
     std::unordered_map<LabelT, std::vector<float>> _label_centroids;
+    // 兼容旧参数保留的投影缓存；当前相关度计算已不再使用低维投影
     std::unordered_map<LabelT, std::vector<float>> _projected_label_centroids;
     std::vector<float> _label_projection_matrix;
     uint32_t _label_projection_dim{32};
+    // 标签质心聚类索引：簇中心、簇成员与标签到簇的映射
+    std::vector<std::vector<float>> _label_cluster_centers;
+    std::vector<std::vector<LabelT>> _label_cluster_members;
+    std::unordered_map<LabelT, uint32_t> _label_to_cluster_id;
+    uint32_t _label_cluster_target_count{256};
+    uint32_t _label_cluster_probe_count{4};
+    uint32_t _label_cluster_kmeans_reps{8};
 
     // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
     std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
@@ -545,6 +632,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // label -> 活跃tag集合（用于局部重选medoid）
     std::unordered_map<LabelT, tsl::robin_set<TagT>> _label_to_active_tags;
+    // 标签 -> 活跃向量 location 集合（用于低频标签直接爆搜）
+    std::unordered_map<LabelT, tsl::robin_set<uint32_t>> _filter_inverted_index;
 
     // Query scratch data structures
     ConcurrentQueue<InMemQueryScratch<T> *> _query_scratch;
