@@ -574,8 +574,7 @@ size_t Index<T, TagT, LabelT>::recompute_label_top_correlations(const std::vecto
                 continue;
             }
             const float dist = compute_label_correlation_distance(centroid_it->second, other_it->second);
-            const float score = 1.0f / (1.0f + dist);
-            items.emplace_back(score, candidate_label);
+            items.emplace_back(dist, candidate_label);
             candidate_evals++;
         }
 
@@ -583,10 +582,10 @@ size_t Index<T, TagT, LabelT>::recompute_label_top_correlations(const std::vecto
         if (items.size() > take_n && take_n > 0)
         {
             std::nth_element(items.begin(), items.begin() + static_cast<ptrdiff_t>(take_n), items.end(),
-                             [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
+                             [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
             items.resize(take_n);
         }
-        std::sort(items.begin(), items.end(), [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
+        std::sort(items.begin(), items.end(), [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
 
         _label_top_correlations[label] = items;
         auto &row = _label_correlation_matrix[label];
@@ -829,7 +828,7 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                     out.close();
                 }
 
-                // 2) Top-K correlations per label
+                // 2) 每个标签按 centroid 距离升序排列的 Top-K 近邻标签
                 if (!_label_top_correlations.empty())
                 {
                     std::ofstream out(std::string(filename) + "_label_topk.txt");
@@ -841,7 +840,7 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                         {
                             if (!first)
                                 out << ';';
-                            out << pr.second << "," << pr.first; // store as label,score
+                            out << pr.second << "," << pr.first; // 存储为 label,distance
                             first = false;
                         }
                         out << '\n';
@@ -1199,7 +1198,7 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                     if (!std::getline(iss, token, '\t'))
                         continue;
                     LabelT a = (LabelT)std::stoul(token);
-                    // pairs: labelB,score;labelB2,score2;...
+                    // pairs: labelB,distance;labelB2,distance2;...
                     if (std::getline(iss, token))
                     {
                         std::istringstream pairs_stream(token);
@@ -1219,7 +1218,7 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                 }
             }
 
-            // 2) Top-K correlations per label
+            // 2) 每个标签按 centroid 距离升序排列的 Top-K 近邻标签
             std::string topk_file = std::string(filename) + "_label_topk.txt";
             if (file_exists(topk_file))
             {
@@ -1248,8 +1247,8 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
                             if (comma_pos == std::string::npos)
                                 continue;
                             LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
-                            float s = std::stof(pair_tok.substr(comma_pos + 1));
-                            items.emplace_back(s, b);
+                            float distance = std::stof(pair_tok.substr(comma_pos + 1));
+                            items.emplace_back(distance, b);
                         }
                         _label_top_correlations[a] = std::move(items);
                     }
@@ -2070,7 +2069,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
                   << " probe_clusters=" << _label_cluster_probe_count << std::endl;
 }
 
-// 基于簇筛选候选集，计算每个标签的 Top-K 相关标签列表（降序）
+// 基于簇筛选候选集，计算每个标签的 Top-K 近邻标签列表（按 centroid 距离升序）
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
 {
     _label_top_correlations.clear();
@@ -3493,9 +3492,11 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     }
 
     const uint32_t max_live_location = static_cast<uint32_t>(std::min(_location_to_labels.size(), _max_points));
+    const bool has_empty_slots = !_empty_slots.is_empty();
     for (uint32_t location = 0; location < max_live_location; location++)
     {
-        if (_empty_slots.is_in_set(location))
+        // 中文说明：静态普通建图没有空槽，避免在空 bitset 上测试 location 导致越界。
+        if (has_empty_slots && _empty_slots.is_in_set(location))
         {
             continue;
         }
@@ -3987,7 +3988,7 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
             const size_t take_n = std::min(static_cast<size_t>(effective_expand_num), it->second.size());
             for (size_t i = 0; i < take_n; i++)
             {
-                // it->second 已按相关性分数从高到低排序（compute_top_k_label_correlations 生成）
+                // it->second 已按 centroid 距离从小到大排序（compute_top_k_label_correlations 生成）
                 filter_vec.emplace_back(it->second[i].second);
                 num++;
             }

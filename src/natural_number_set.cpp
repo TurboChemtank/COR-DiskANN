@@ -62,7 +62,7 @@ template <typename T> size_t natural_number_set<T>::size() const
 
 template <typename T> bool natural_number_set<T>::is_in_set(T id) const
 {
-    return _values_bitset->test(id);
+    return static_cast<size_t>(id) < _values_bitset->size() && _values_bitset->test(id);
 }
 
 // Instantiate used templates.
