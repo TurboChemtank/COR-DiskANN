@@ -369,7 +369,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // 【新增声明 - 中文说明】基于已加载的标签，准备频率统计与标签起点
     void prepare_label_metadata(const size_t num_points_to_load);
 
-    // 计算每个标签的Top-K近邻标签（按 centroid 距离升序）
+    // 计算每个标签的Top-K相关标签（按一跳图邻居属性共现次数降序）
     void compute_top_k_label_correlations();
 
     std::unordered_map<std::string, LabelT> load_label_map(const std::string &map_file);
@@ -415,7 +415,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     void recompute_label_cluster_center(uint32_t cluster_id);
     // 为某个标签质心找到最近的若干个簇
     std::vector<uint32_t> get_nearest_label_clusters(const std::vector<float> &centroid) const;
-    // 基于簇筛选候选集后，重算给定标签集合的 Top-K 近邻标签
+    // 基于一跳图邻居属性共现次数，重算给定标签集合的 Top-K 相关标签
     size_t recompute_label_top_correlations(const std::vector<LabelT> &labels);
 
     // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
@@ -431,7 +431,7 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     // 判断是否达到标签元数据懒更新阈值（基于插入+删除累计次数）
     bool need_flush_pending_label_updates() const;
-    // 应用累积的标签元数据增量（频率、门槛、centroid、medoid、相关性、Top-K）
+    // 应用累积的标签元数据增量（频率、门槛、medoid、相关性、Top-K）
     void flush_pending_label_updates(const bool force = false);
     // 记录插入事件及对应标签增量
     void record_insert_label_updates(uint32_t location, const TagT tag, const T *point,
@@ -576,14 +576,14 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t _filterIndexingQueueSize;
     std::unordered_map<std::string, LabelT> _label_map;
 
-    // 【新增成员 - 中文说明】标签近邻缓存：当前仅缓存已重算标签的候选 centroid 距离
-    // 采用嵌套map: labelA -> (labelB -> distance)
+    // 【新增成员 - 中文说明】标签相关性缓存：当前仅缓存已重算标签的候选共现次数
+    // 采用嵌套map: labelA -> (labelB -> count)
     std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
 
-    // 每个标签的Top-K近邻标签列表，pair.first 表示 centroid 距离
+    // 每个标签的Top-K相关标签列表，pair.first 表示共现次数
     std::unordered_map<LabelT, std::vector<std::pair<float, LabelT>>> _label_top_correlations;
 
-    // 【新增成员 - 中文说明】每个标签的中心向量（用于基于中心距离的相关度）
+    // 【兼容保留 - 中文说明】旧 centroid 相关缓存，当前相关度计算不再依赖它。
     std::unordered_map<LabelT, std::vector<float>> _label_centroids;
     // 兼容旧参数保留的投影缓存；当前相关度计算已不再使用低维投影
     std::unordered_map<LabelT, std::vector<float>> _projected_label_centroids;
