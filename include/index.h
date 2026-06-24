@@ -25,6 +25,7 @@
 #include "quantized_distance.h"
 #include "pq_data_store.h"
 #include <atomic>
+#include <tuple>
 
 #define OVERHEAD_FACTOR 1.1
 #define EXPAND_IF_FULL 0
@@ -205,17 +206,25 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     }
 
     // 中文说明：支持“多标签 OR 合并搜索”，可指定是否额外加入默认全局起点。
+    // probe_seed_ids 非空时：正式搜索起点为 probe 返回的满足 OR 的 seed（最多 5 个），不足 5 则用 S 的 medoid 补齐。
     DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>
     search_with_filter_label_group(const T *query, const std::vector<std::string> &raw_filter_labels, const size_t K,
                                    const uint32_t L, uint32_t *indices, float *distances,
-                                   const int expand_num = -1, const bool include_unfiltered_starts = false);
+                                   const int expand_num = -1, const bool include_unfiltered_starts = false,
+                                   const std::vector<uint32_t> *probe_seed_ids = nullptr);
 
     // 中文说明：与上面相同，但输出外部 tag，便于动态索引评测。
     DISKANN_DLLEXPORT std::pair<size_t, uint32_t>
     search_with_filter_label_group_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
                                         float *distances, std::vector<T *> &res_vectors,
                                         const std::vector<std::string> &raw_filter_labels,
-                                        const int expand_num = -1, const bool include_unfiltered_starts = false);
+                                        const int expand_num = -1, const bool include_unfiltered_starts = false,
+                                        const std::vector<uint32_t> *probe_seed_ids = nullptr);
+
+    // 中文说明：以查询属性 medoid 为起点执行无过滤 probe 搜索；返回 R、距离比较次数、满足 OR 的 top-5 seed。
+    DISKANN_DLLEXPORT std::tuple<double, uint32_t, std::vector<uint32_t>>
+    probe_filter_label_group_valid_ratio(const T *query, const std::vector<std::string> &raw_filter_labels,
+                                         const uint32_t L);
 
     // 中文说明：基于倒排索引直接枚举候选并爆搜单标签。
     DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>

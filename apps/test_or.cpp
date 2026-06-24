@@ -13,8 +13,8 @@
 #include <omp.h>
 #include <queue>
 #include <sstream>
+#include <tuple>
 #include <string.h>
-#include <unordered_map>
 #include <vector>
 #include <boost/program_options.hpp>
 
@@ -169,52 +169,6 @@ void build_dynamic_groundtruth(diskann::AbstractIndex &index, diskann::Metric me
     }
 
     std::cout << "Dynamic ground truth built." << std::endl;
-}
-
-// 中文说明：把一次子搜索结果 merge 到总结果里；若同一 id 出现多次，只保留更优距离。
-inline void merge_partial_results(const uint32_t *ids, const float *dists, size_t k, diskann::Metric metric,
-                                  std::unordered_map<uint32_t, float> &best_dist_by_id)
-{
-    for (size_t i = 0; i < k; i++)
-    {
-        if (!std::isfinite(dists[i]))
-        {
-            continue;
-        }
-
-        const float sortable_dist = metric == diskann::Metric::INNER_PRODUCT ? -dists[i] : dists[i];
-        auto it = best_dist_by_id.find(ids[i]);
-        if (it == best_dist_by_id.end() || sortable_dist < it->second)
-        {
-            best_dist_by_id[ids[i]] = sortable_dist;
-        }
-    }
-}
-
-// 中文说明：把 merge 完的候选按距离排序后写回最终 top-k。
-inline void write_merged_topk(const std::unordered_map<uint32_t, float> &best_dist_by_id, size_t k,
-                              diskann::Metric metric, uint32_t *out_ids, float *out_dists)
-{
-    std::vector<std::pair<float, uint32_t>> ordered;
-    ordered.reserve(best_dist_by_id.size());
-    for (const auto &kv : best_dist_by_id)
-    {
-        ordered.emplace_back(kv.second, kv.first);
-    }
-    std::sort(ordered.begin(), ordered.end(),
-              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second); });
-
-    size_t pos = 0;
-    for (; pos < k && pos < ordered.size(); pos++)
-    {
-        out_ids[pos] = ordered[pos].second;
-        out_dists[pos] = metric == diskann::Metric::INNER_PRODUCT ? -ordered[pos].first : ordered[pos].first;
-    }
-    for (; pos < k; pos++)
-    {
-        out_ids[pos] = 0;
-        out_dists[pos] = std::numeric_limits<float>::infinity();
-    }
 }
 
 template <typename T, typename LabelT = uint32_t>
@@ -385,155 +339,65 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             current_query_labels.erase(std::unique(current_query_labels.begin(), current_query_labels.end()),
                                        current_query_labels.end());
 
-            const uint32_t threshold = index->get_filter_frequency_threshold();
-            const double low_cutoff = static_cast<double>(threshold) * 0.01;
-            std::vector<std::string> high_freq_labels;
-            std::vector<std::string> mid_freq_labels;
-            std::vector<std::string> low_freq_labels;
-            high_freq_labels.reserve(current_query_labels.size());
-            mid_freq_labels.reserve(current_query_labels.size());
-            low_freq_labels.reserve(current_query_labels.size());
-
-            for (const auto &label : current_query_labels)
-            {
-                const uint32_t freq = index->get_filter_frequency(label);
-                if (freq > threshold)
-                {
-                    high_freq_labels.emplace_back(label);
-                }
-                else if (static_cast<double>(freq) > low_cutoff)
-                {
-                    mid_freq_labels.emplace_back(label);
-                }
-                else
-                {
-                    low_freq_labels.emplace_back(label);
-                }
-            }
-
-            std::unordered_map<uint32_t, float> merged_best;
-            merged_best.reserve(std::max<size_t>(1, current_query_labels.size() * recall_at));
-            std::vector<uint32_t> temp_ids(recall_at, 0);
+            uint32_t *out_ids = query_result_ids[test_id].data() + i * recall_at;
+            float *out_dists = query_result_dists[test_id].data() + i * recall_at;
             std::vector<TagT> temp_tags(recall_at, TagT{});
-            std::vector<float> temp_dists(recall_at, std::numeric_limits<float>::infinity());
             std::vector<T *> temp_res_vectors;
             uint32_t current_cmp_stats = 0;
 
-            auto merge_ids = [&]() {
-                merge_partial_results(temp_ids.data(), temp_dists.data(), recall_at, metric, merged_best);
-            };
-            auto merge_tags = [&]() {
-                merge_partial_results(temp_tags.data(), temp_dists.data(), recall_at, metric, merged_best);
-            };
+            const uint32_t K_cor = expand_labels_k;
+            uint32_t adaptive_expand_k = K_cor;
+            std::vector<uint32_t> probe_seeds;
+            const std::vector<uint32_t> *probe_seed_ptr = nullptr;
 
-            // 中文说明：高频标签单独做一次普通过滤搜索，不做标签扩展。
-            for (const auto &label : high_freq_labels)
+            // 中文说明：probe 估计局部 OR 有效率 R，并收集满足 OR 的 top-5 作为正式搜索起点。
+            if (!current_query_labels.empty())
             {
+                const uint32_t probe_L = std::max<uint32_t>(L / 2, 30);
                 try
                 {
-                    if (dynamic && tags)
+                    auto probe_ret = typed_index->probe_filter_label_group_valid_ratio(
+                        query_vec, current_query_labels, probe_L);
+                    double R = std::get<0>(probe_ret);
+                    R = std::max(0.0, std::min(1.0, R));
+                    current_cmp_stats += std::get<1>(probe_ret);
+                    probe_seeds = std::get<2>(probe_ret);
+                    probe_seed_ptr = &probe_seeds;
+                    if (K_cor > 0)
                     {
-                        auto retval = typed_index->search_with_filter_label_group_tags(
-                            query_vec, recall_at, L, temp_tags.data(), temp_dists.data(), temp_res_vectors, {label}, 0,
-                            true);
-                        current_cmp_stats += retval.second;
-                        merge_tags();
-                    }
-                    else
-                    {
-                        auto retval = typed_index->search_with_filter_label_group(
-                            query_vec, {label}, recall_at, L, temp_ids.data(), temp_dists.data(), 0, true);
-                        current_cmp_stats += retval.second;
-                        merge_ids();
+                        const double factor = std::max(0.0, 1.0 - R);
+                        adaptive_expand_k =
+                            static_cast<uint32_t>(std::ceil(static_cast<double>(K_cor) * factor));
+                        adaptive_expand_k = std::min<uint32_t>(adaptive_expand_k, K_cor);
                     }
                 }
                 catch (const std::exception &)
                 {
-                    // 中文说明：若常规过滤搜索因为缺少 medoid 等原因失败，则回退到倒排爆搜保证可用性。
-                    if (dynamic && tags)
-                    {
-                        auto retval = typed_index->brute_force_search_filter_label_tags(
-                            query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
-                        current_cmp_stats += retval.second;
-                        merge_tags();
-                    }
-                    else
-                    {
-                        auto retval = typed_index->brute_force_search_filter_label(
-                            query_vec, label, recall_at, temp_ids.data(), temp_dists.data());
-                        current_cmp_stats += retval.second;
-                        merge_ids();
-                    }
+                    adaptive_expand_k = K_cor;
+                    probe_seed_ptr = &probe_seeds;
                 }
             }
 
-            // 中文说明：中频标签合并成一次 OR 搜索，起点只放各标签 medoid，并允许相关标签扩展。
-            if (!mid_freq_labels.empty())
+            // 中文说明：对完整 OR 标签集合 S 执行一次 group search，起点为 probe top-5 valid + medoid 补齐。
+            if (dynamic && tags)
             {
-                try
+                auto retval = typed_index->search_with_filter_label_group_tags(
+                    query_vec, recall_at, L, temp_tags.data(), out_dists, temp_res_vectors, current_query_labels,
+                    static_cast<int>(adaptive_expand_k), false, probe_seed_ptr);
+                current_cmp_stats += retval.second;
+                for (size_t j = 0; j < recall_at; j++)
                 {
-                    if (dynamic && tags)
-                    {
-                        auto retval = typed_index->search_with_filter_label_group_tags(
-                            query_vec, recall_at, L, temp_tags.data(), temp_dists.data(), temp_res_vectors,
-                            mid_freq_labels, (int)expand_labels_k, false);
-                        current_cmp_stats += retval.second;
-                        merge_tags();
-                    }
-                    else
-                    {
-                        auto retval = typed_index->search_with_filter_label_group(
-                            query_vec, mid_freq_labels, recall_at, L, temp_ids.data(), temp_dists.data(),
-                            (int)expand_labels_k, false);
-                        current_cmp_stats += retval.second;
-                        merge_ids();
-                    }
-                }
-                catch (const std::exception &)
-                {
-                    // 中文说明：合并搜索失败时，退化成逐标签倒排爆搜，保证结果仍然完整。
-                    for (const auto &label : mid_freq_labels)
-                    {
-                        if (dynamic && tags)
-                        {
-                            auto retval = typed_index->brute_force_search_filter_label_tags(
-                                query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
-                            current_cmp_stats += retval.second;
-                            merge_tags();
-                        }
-                        else
-                        {
-                            auto retval = typed_index->brute_force_search_filter_label(
-                                query_vec, label, recall_at, temp_ids.data(), temp_dists.data());
-                            current_cmp_stats += retval.second;
-                            merge_ids();
-                        }
-                    }
+                    out_ids[j] = static_cast<uint32_t>(temp_tags[j]);
                 }
             }
-
-            // 中文说明：超低频标签直接走倒排索引，把 posting 全部拿出来爆搜。
-            for (const auto &label : low_freq_labels)
+            else
             {
-                if (dynamic && tags)
-                {
-                    auto retval = typed_index->brute_force_search_filter_label_tags(
-                        query_vec, label, recall_at, temp_tags.data(), temp_dists.data(), temp_res_vectors);
-                    current_cmp_stats += retval.second;
-                    merge_tags();
-                }
-                else
-                {
-                    auto retval =
-                        typed_index->brute_force_search_filter_label(query_vec, label, recall_at, temp_ids.data(),
-                                                                     temp_dists.data());
-                    current_cmp_stats += retval.second;
-                    merge_ids();
-                }
+                auto retval = typed_index->search_with_filter_label_group(
+                    query_vec, current_query_labels, recall_at, L, out_ids, out_dists,
+                    static_cast<int>(adaptive_expand_k), false, probe_seed_ptr);
+                current_cmp_stats += retval.second;
             }
 
-            write_merged_topk(merged_best, recall_at, metric, query_result_ids[test_id].data() + i * recall_at,
-                              query_result_dists[test_id].data() + i * recall_at);
             cmp_stats[i] = current_cmp_stats;
 
             auto qe = std::chrono::high_resolution_clock::now();

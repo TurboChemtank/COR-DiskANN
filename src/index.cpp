@@ -4012,7 +4012,8 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
                                                        const std::vector<std::string> &raw_filter_labels,
                                                        const size_t K, const uint32_t L, uint32_t *indices,
                                                        float *distances, const int expand_num,
-                                                       const bool include_unfiltered_starts)
+                                                       const bool include_unfiltered_starts,
+                                                       const std::vector<uint32_t> *probe_seed_ids)
 {
     if (K > (uint64_t)L)
     {
@@ -4046,16 +4047,49 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
 
     std::vector<uint32_t> init_ids = include_unfiltered_starts ? get_init_ids() : std::vector<uint32_t>();
     const std::vector<LabelT> filter_labels = build_expanded_filter_labels(base_labels, expand_num);
-    size_t medoid_count = 0;
+    static constexpr uint32_t kFormalSearchStartCount = 5;
+    const uint32_t max_points = _max_points;
+
+    auto push_unique_start = [&init_ids, max_points](uint32_t id) {
+        if (id >= max_points)
+        {
+            return;
+        }
+        if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end())
+        {
+            init_ids.emplace_back(id);
+        }
+    };
+
+    if (probe_seed_ids != nullptr)
+    {
+        for (const uint32_t id : *probe_seed_ids)
+        {
+            if (init_ids.size() >= kFormalSearchStartCount)
+            {
+                break;
+            }
+            push_unique_start(id);
+        }
+
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        for (const auto &label : base_labels)
+        {
+            if (init_ids.size() >= kFormalSearchStartCount)
+            {
+                break;
+            }
+            auto it = _label_to_start_id.find(label);
+            if (it == _label_to_start_id.end())
+            {
+                continue;
+            }
+            push_unique_start(it->second);
+        }
+    }
+    else
     {
         std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
-        auto push_unique = [&init_ids](uint32_t id) {
-            if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end())
-            {
-                init_ids.emplace_back(id);
-            }
-        };
-
         for (const auto &label : base_labels)
         {
             auto it = _label_to_start_id.find(label);
@@ -4063,12 +4097,11 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
             {
                 continue;
             }
-            push_unique(it->second);
-            medoid_count++;
+            push_unique_start(it->second);
         }
     }
 
-    if (medoid_count == 0)
+    if (init_ids.empty())
     {
         throw diskann::ANNException("No filtered medoid found. exitting ", -1);
     }
@@ -4117,17 +4150,99 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
 }
 
 template <typename T, typename TagT, typename LabelT>
+std::tuple<double, uint32_t, std::vector<uint32_t>> Index<T, TagT, LabelT>::probe_filter_label_group_valid_ratio(
+    const T *query, const std::vector<std::string> &raw_filter_labels, const uint32_t L)
+{
+    const std::vector<LabelT> base_labels = convert_filter_labels(raw_filter_labels);
+    if (base_labels.empty())
+    {
+        return {0.0, 0U, {}};
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+
+    if (L > scratch->get_L())
+    {
+        diskann::cout << "Attempting to expand query scratch_space. Was created "
+                      << "with Lsize: " << scratch->get_L() << " but probe L is: " << L << std::endl;
+        scratch->resize_for_new_L(L);
+        diskann::cout << "Resize completed. New scratch->L is " << scratch->get_L() << std::endl;
+    }
+
+    std::vector<uint32_t> init_ids;
+    size_t medoid_count = 0;
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        auto push_unique = [&init_ids](uint32_t id) {
+            if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end())
+            {
+                init_ids.emplace_back(id);
+            }
+        };
+
+        for (const auto &label : base_labels)
+        {
+            auto it = _label_to_start_id.find(label);
+            if (it == _label_to_start_id.end())
+            {
+                continue;
+            }
+            push_unique(it->second);
+            medoid_count++;
+        }
+    }
+
+    if (medoid_count == 0)
+    {
+        return {0.0, 0U, {}};
+    }
+
+    const std::vector<LabelT> empty_filter_labels;
+    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+    _data_store->preprocess_query(query, scratch);
+    auto retval = iterate_to_fixed_point(scratch, L, init_ids, false, empty_filter_labels, true);
+
+    const auto &best_L_nodes = scratch->best_l_nodes();
+    uint32_t candidate_count = 0;
+    uint32_t valid_count = 0;
+    std::vector<uint32_t> top_valid_seed_ids;
+    top_valid_seed_ids.reserve(5);
+    for (size_t i = 0; i < best_L_nodes.size(); ++i)
+    {
+        const uint32_t loc = best_L_nodes[i].id;
+        if (loc >= _max_points)
+        {
+            continue;
+        }
+        candidate_count++;
+        if (detect_common_filters(loc, true, base_labels))
+        {
+            valid_count++;
+            if (top_valid_seed_ids.size() < 5)
+            {
+                top_valid_seed_ids.push_back(loc);
+            }
+        }
+    }
+
+    const double R = candidate_count == 0 ? 0.0 : static_cast<double>(valid_count) / static_cast<double>(candidate_count);
+    return {R, retval.second, std::move(top_valid_seed_ids)};
+}
+
+template <typename T, typename TagT, typename LabelT>
 std::pair<size_t, uint32_t>
 Index<T, TagT, LabelT>::search_with_filter_label_group_tags(const T *query, const uint64_t K, const uint32_t L,
                                                             TagT *tags, float *distances,
                                                             std::vector<T *> &res_vectors,
                                                             const std::vector<std::string> &raw_filter_labels,
                                                             const int expand_num,
-                                                            const bool include_unfiltered_starts)
+                                                            const bool include_unfiltered_starts,
+                                                            const std::vector<uint32_t> *probe_seed_ids)
 {
     std::vector<uint32_t> locations(K, 0);
     auto retval = search_with_filter_label_group(query, raw_filter_labels, static_cast<size_t>(K), L, locations.data(),
-                                                 distances, expand_num, include_unfiltered_starts);
+                                                 distances, expand_num, include_unfiltered_starts, probe_seed_ids);
 
     size_t pos = 0;
     std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
