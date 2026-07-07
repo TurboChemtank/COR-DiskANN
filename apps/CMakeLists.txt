@@ -20,6 +20,9 @@ target_link_libraries(multi_filters_search_memory_index ${PROJECT_NAME} ${DISKAN
 add_executable(test_or test_or.cpp)
 target_link_libraries(test_or ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
 
+add_executable(test_global_selectivity test_global_selectivity.cpp)
+target_link_libraries(test_global_selectivity ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
 
 add_executable(build_disk_index build_disk_index.cpp)
 target_link_libraries(build_disk_index ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} ${DISKANN_ASYNC_LIB} Boost::program_options)
@@ -50,6 +53,7 @@ if (NOT MSVC)
             test_insert_deletes_consolidate
             test_incremental_filtered_updates
             test_or
+            test_global_selectivity
             RUNTIME
     )
 endif()

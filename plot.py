@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 
 logs = {
     # "beta=0.0":   "/home/wtj/Beta-DiskANN/build/demo/out/search_k.txt",
-    "no cor":  "/home/wangtj/results/tripclick/no_cor.txt",
+    "global":  "/home/wangtj/results/tripclick/global_selectivity.txt",
     # "beta=0.8": "/home/wtj/Beta-DiskANN/build/demo/out/search_beta0.8_k.txt",
-    "use cor": "/home/wangtj/results/tripclick/COR1.txt",
+    "cor": "/home/wangtj/results/tripclick/COR1.txt",
 }
 
 def parse_log(path):
@@ -43,7 +43,7 @@ plt.ylabel("QPS")
 plt.title("QPS vs Recall@10")
 plt.grid(True, linestyle="--", alpha=0.4)
 plt.legend()
-out_png = "/home/wangtj/results/tripclick/compare.png"
+out_png = "/home/wangtj/results/tripclick/compare1.png"
 plt.tight_layout()
 plt.savefig(out_png, dpi=150)
 print("Saved:", out_png)
