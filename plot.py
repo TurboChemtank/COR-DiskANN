@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 
 logs = {
     # "beta=0.0":   "/home/wtj/Beta-DiskANN/build/demo/out/search_k.txt",
-    "original":  "/home/wtj/COR-DiskANN/build/results/arxiv/search.txt",
+    "no cor":  "/home/wangtj/results/tripclick/no_cor.txt",
     # "beta=0.8": "/home/wtj/Beta-DiskANN/build/demo/out/search_beta0.8_k.txt",
-    "use cor": "/home/wtj/COR-DiskANN/build/results/arxiv/search_COR.txt",
+    "use cor": "/home/wangtj/results/tripclick/COR1.txt",
 }
 
 def parse_log(path):
@@ -17,7 +17,7 @@ def parse_log(path):
                 continue
             tokens = line.split()
             # 期望: [Ls, QPS, AvgCmps, MeanLatency, P99, R1, ..., R10]
-            if len(tokens) < 5 + 10:
+            if len(tokens) < 5 + 1:
                 continue
             try:
                 qps = float(tokens[1])
@@ -43,7 +43,7 @@ plt.ylabel("QPS")
 plt.title("QPS vs Recall@10")
 plt.grid(True, linestyle="--", alpha=0.4)
 plt.legend()
-out_png = "/home/wtj/COR-DiskANN/build/results/arxiv/compare.png"
+out_png = "/home/wangtj/results/tripclick/compare.png"
 plt.tight_layout()
 plt.savefig(out_png, dpi=150)
 print("Saved:", out_png)

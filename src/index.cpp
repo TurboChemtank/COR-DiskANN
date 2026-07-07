@@ -4047,7 +4047,6 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
 
     std::vector<uint32_t> init_ids = include_unfiltered_starts ? get_init_ids() : std::vector<uint32_t>();
     const std::vector<LabelT> filter_labels = build_expanded_filter_labels(base_labels, expand_num);
-    static constexpr uint32_t kFormalSearchStartCount = 5;
     const uint32_t max_points = _max_points;
 
     auto push_unique_start = [&init_ids, max_points](uint32_t id) {
@@ -4065,26 +4064,26 @@ Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
     {
         for (const uint32_t id : *probe_seed_ids)
         {
-            if (init_ids.size() >= kFormalSearchStartCount)
-            {
-                break;
-            }
             push_unique_start(id);
         }
 
-        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
-        for (const auto &label : base_labels)
+        const size_t target_start_count = base_labels.size();
+        if (init_ids.size() < target_start_count)
         {
-            if (init_ids.size() >= kFormalSearchStartCount)
+            std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+            for (const auto &label : base_labels)
             {
-                break;
+                if (init_ids.size() >= target_start_count)
+                {
+                    break;
+                }
+                auto it = _label_to_start_id.find(label);
+                if (it == _label_to_start_id.end())
+                {
+                    continue;
+                }
+                push_unique_start(it->second);
             }
-            auto it = _label_to_start_id.find(label);
-            if (it == _label_to_start_id.end())
-            {
-                continue;
-            }
-            push_unique_start(it->second);
         }
     }
     else
@@ -4206,8 +4205,8 @@ std::tuple<double, uint32_t, std::vector<uint32_t>> Index<T, TagT, LabelT>::prob
     const auto &best_L_nodes = scratch->best_l_nodes();
     uint32_t candidate_count = 0;
     uint32_t valid_count = 0;
-    std::vector<uint32_t> top_valid_seed_ids;
-    top_valid_seed_ids.reserve(5);
+    std::vector<uint32_t> valid_seed_ids;
+    valid_seed_ids.reserve(best_L_nodes.size());
     for (size_t i = 0; i < best_L_nodes.size(); ++i)
     {
         const uint32_t loc = best_L_nodes[i].id;
@@ -4219,15 +4218,12 @@ std::tuple<double, uint32_t, std::vector<uint32_t>> Index<T, TagT, LabelT>::prob
         if (detect_common_filters(loc, true, base_labels))
         {
             valid_count++;
-            if (top_valid_seed_ids.size() < 5)
-            {
-                top_valid_seed_ids.push_back(loc);
-            }
+            valid_seed_ids.push_back(loc);
         }
     }
 
     const double R = candidate_count == 0 ? 0.0 : static_cast<double>(valid_count) / static_cast<double>(candidate_count);
-    return {R, retval.second, std::move(top_valid_seed_ids)};
+    return {R, retval.second, std::move(valid_seed_ids)};
 }
 
 template <typename T, typename TagT, typename LabelT>

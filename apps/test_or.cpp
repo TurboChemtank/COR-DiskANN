@@ -350,10 +350,10 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             std::vector<uint32_t> probe_seeds;
             const std::vector<uint32_t> *probe_seed_ptr = nullptr;
 
-            // 中文说明：probe 估计局部 OR 有效率 R，并收集满足 OR 的 top-5 作为正式搜索起点。
-            if (!current_query_labels.empty())
+            // 中文说明：expand_labels_k>0 且 L>40 时才做 probe；否则跳过探测，直接正式搜索。
+            if (K_cor > 0 && L > 40 && !current_query_labels.empty())
             {
-                const uint32_t probe_L = std::max<uint32_t>(L / 2, 30);
+                const uint32_t probe_L = std::max<uint32_t>(20, L / 2);
                 try
                 {
                     auto probe_ret = typed_index->probe_filter_label_group_valid_ratio(
@@ -366,8 +366,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                     if (K_cor > 0)
                     {
                         const double factor = std::max(0.0, 1.0 - R);
-                        adaptive_expand_k =
-                            static_cast<uint32_t>(std::ceil(static_cast<double>(K_cor) * factor));
+                        adaptive_expand_k = static_cast<uint32_t>(std::ceil(static_cast<double>(K_cor) * factor));
                         adaptive_expand_k = std::min<uint32_t>(adaptive_expand_k, K_cor);
                     }
                 }
@@ -378,7 +377,7 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                 }
             }
 
-            // 中文说明：对完整 OR 标签集合 S 执行一次 group search，起点为 probe top-5 valid + medoid 补齐。
+            // 中文说明：对完整 OR 标签集合 S 执行一次 group search；probe 启用时起点为全部 valid seed，不足属性个数时用 medoid 补齐。
             if (dynamic && tags)
             {
                 auto retval = typed_index->search_with_filter_label_group_tags(
