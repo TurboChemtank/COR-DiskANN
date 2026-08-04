@@ -351,9 +351,9 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             const std::vector<uint32_t> *probe_seed_ptr = nullptr;
 
             // 中文说明：expand_labels_k>0 且 L>40 时才做 probe；否则跳过探测，直接正式搜索。
-            if (K_cor > 0 && L > 40 && !current_query_labels.empty())
+            if (K_cor > 0 && L > 100 && !current_query_labels.empty())
             {
-                const uint32_t probe_L = std::max<uint32_t>(20, L / 2);
+                const uint32_t probe_L = std::max<uint32_t>(40, L / 3);
                 try
                 {
                     auto probe_ret = typed_index->probe_filter_label_group_valid_ratio(
